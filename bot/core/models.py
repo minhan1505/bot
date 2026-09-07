@@ -44,11 +44,18 @@ class CalibrationProfile(BaseModel):
     sample_count_neg: int = 0
     calibrated_at: float = Field(default_factory=time.time)
 
-    def is_valid_for(self, model_sha256: str, precision: str, canonical_size: Tuple[int, int]) -> bool:
+    def is_valid_for(
+        self,
+        model_sha256: str,
+        precision: str,
+        canonical_size: Tuple[int, int],
+        preprocessing_version: str = "v2.3_canonical_letterbox"
+    ) -> bool:
         return (
             self.model_sha256 == model_sha256
             and self.precision == precision
             and self.canonical_size == canonical_size
+            and self.preprocessing_version == preprocessing_version
         )
 
 

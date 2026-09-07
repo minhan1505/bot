@@ -521,7 +521,7 @@ class MainWindow(QMainWindow):
         """Starts or stops the live bot execution thread."""
         if not self.runner or not self.runner.is_running:
             mode = self.combo_mode.currentText()
-            is_dry_run = "Dry-Run" in mode
+            is_dry_run = "Production" not in mode
 
             if "Production" in mode and not self.action_manager.is_supported:
                 QMessageBox.critical(
