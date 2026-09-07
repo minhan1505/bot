@@ -397,11 +397,16 @@ class BotRuntimeRunner:
                                                 outcome_ok = True
 
                                             if not outcome_ok:
-                                                logger.error(f"Critical ACTION_OUTCOME rejected for Region {owner_region}. Marking evidence incomplete.")
+                                                logger.error(f"Critical ACTION_OUTCOME rejected for Region {owner_region}. Marking evidence incomplete and pausing execution.")
                                                 if hasattr(self.telemetry, "release"):
                                                     self.telemetry.release(token)
                                                 elif hasattr(token, "release"):
                                                     token.release()
+                                                inst.on_action_dispatched()
+                                                inst.transition_to(RegionState.SAFE_PAUSE, reason="Critical ACTION_OUTCOME evidence recording failed")
+                                                if self.on_state_change:
+                                                    self.on_state_change(owner_region, inst.state.value, inst.current_step_index)
+                                                continue
 
                                         # Handle Action Outcome with explicit ActionDispatchResult handling
                                         if isinstance(dispatched, ActionDispatchResult) or hasattr(dispatched, "status"):

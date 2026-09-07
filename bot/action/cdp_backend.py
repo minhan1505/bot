@@ -176,16 +176,34 @@ class CDPActionBackend(BaseActionBackend):
                     }
                 }
                 await ws.send(json.dumps(press_msg))
+                pressed_down = True
                 press_ok, press_err = await _recv_ack(ws, press_id)
                 if not press_ok:
+                    # mousePressed was already transmitted over WebSocket.
+                    # Since physical click-down may have taken effect in Chrome,
+                    # the outcome cannot be treated as NOT_SENT; it must be UNCERTAIN.
+                    try:
+                        self._msg_id += 1
+                        emergency_release_msg = {
+                            "id": self._msg_id,
+                            "method": "Input.dispatchMouseEvent",
+                            "params": {
+                                "type": "mouseReleased",
+                                "x": css_x,
+                                "y": css_y,
+                                "button": "left",
+                                "clickCount": 1
+                            }
+                        }
+                        await ws.send(json.dumps(emergency_release_msg))
+                    except Exception:
+                        pass
                     return ActionDispatchResult(
-                        ActionDispatchStatus.NOT_SENT,
-                        f"CDP mousePressed failed: {press_err}",
+                        ActionDispatchStatus.UNCERTAIN,
+                        f"CDP mousePressed sent but ACK failed: {press_err}",
                         target_screen_pt=(screen_x, screen_y),
                         viewport_css_pt=(css_x, css_y)
                     )
-
-                pressed_down = True
 
                 # Short inter-event delay (30ms)
                 await asyncio.sleep(0.030)

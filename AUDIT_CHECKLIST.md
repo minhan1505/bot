@@ -297,3 +297,33 @@ Output includes the comprehensive markdown benchmark report verifying 0 samples 
 | **Pretrained Vision Model Weights** | ONNX dynamic dimension inspection, batch L2 normalization, and cosine similarity cache verified. | Official pretrained weights file `models/ui_vision_encoder.onnx` (currently uses random-weight backbone export in dev script). | Real-symbol accuracy benchmark on unseen web/game targets (A1). | Full pipeline execution, proposal engine, escalation, and tri-gate logic. |
 | **Golden Symbol Dataset & Confusers** | Geometry separability guard at crop, mathematical pre-overlap threshold search on $D_{calib}$ / $D_{val}$ enforcing zero false positives. | Real user screen crops of the 19 casino targets and explicit operational confusers (neighboring UI buttons). | Generating final production `calibration.json` profiles with empirical thresholds. | Pre-overlap rejection mathematical validation, geometry verifier, and contour density guards. |
 | **Hardware Staging Multi-Monitor Rig** | Two-tier scheduler, same-frame escalation, live runner loop, CDP WebSocket and Win32 PostMessage background dispatch. | Physical multi-monitor testbed running 19 concurrent Chrome tables at mixed DPI. | Physical 10-minute stationary mouse cursor certification on live browser hardware and live hardware SLA latency (A7, A8). | Algorithmic pipeline latency benchmark ($\le 45\text{ ms} \ll 700\text{ ms}$), memory isolation, and anti-runaway safety guards. |
+
+---
+
+## 9. QA Follow-up Verification (S01 — S02, Commit db4d20e / b15972e)
+
+### S01 — CDP Mouse-Down Sent but Lost ACK Returns UNCERTAIN (Closing R01)
+- **Confirmation:** Confirmed.
+- **Root Cause:** In `bot/action/cdp_backend.py`, after `await ws.send(press_msg)` transmitted `mousePressed` to the browser, if `_recv_ack` timed out or raised an exception, the method returned `ActionDispatchStatus.NOT_SENT`. `pressed_down` was only set to `True` after ACK. Consequently, if `mousePressed` was sent across the WebSocket but the ACK was dropped or timed out, the runner treated it as `NOT_SENT` and allowed retrying an action that may have already taken physical effect in Chrome.
+- **Files Modified:** [`bot/action/cdp_backend.py`](file:///D:/xampp/bot/bot/action/cdp_backend.py).
+- **Fix:** Set `pressed_down = True` immediately upon successful completion of `await ws.send(press_msg)`. If `_recv_ack` fails, attempt an emergency recovery `mouseReleased` event and return `ActionDispatchResult(ActionDispatchStatus.UNCERTAIN, reason)`. Any unhandled exception after `ws.send` also resolves to `UNCERTAIN` via the `pressed_down` guard.
+- **Counterexample Test:** `qa/test_db4d20e_followup.py::test_press_sent_but_ack_lost_is_uncertain` (**PASSED**).
+
+### S02 — Telemetry ACTION_OUTCOME Failure Records First Action & Safe-Pauses Workflow (Closing R04)
+- **Confirmation:** Confirmed.
+- **Root Cause:** In `bot/workflow/runner.py`, when `outcome_ok` was `False`, the runner only logged an error and released the reservation token, but still proceeded to advance `current_step_index` and dispatch subsequent workflow steps (eventually reporting `DONE` in a multi-step workflow without audit evidence).
+- **Files Modified:** [`bot/workflow/runner.py`](file:///D:/xampp/bot/bot/workflow/runner.py).
+- **Fix:** When `outcome_ok` is `False`, the runner records the first action via `inst.on_action_dispatched()` (preserving the factual execution count), transitions the instance to `RegionState.SAFE_PAUSE`, invokes `on_state_change`, and issues `continue` to halt all further step execution and block subsequent action dispatches.
+- **Counterexample Test:** `qa/test_db4d20e_followup.py::test_outcome_evidence_failure_blocks_new_actions` (**PASSED**).
+
+---
+
+## 10. Test Suite Summary
+
+- **Total Automated Tests:** 64 passed (0 failed, 0 skipped).
+  - 49 Unit & Integration Tests (`tests/`)
+  - 7 Acceptance Counterexample Tests (`qa/test_ae5036a_acceptance.py`)
+  - 4 Robustness Counterexample Tests (`qa/test_79168c8_followup.py`)
+  - 2 Follow-up Regression Tests (`qa/test_db4d20e_followup.py`)
+  - 2 Independent Regression Scenarios (`qa/test_independent_regressions.py`)
+
