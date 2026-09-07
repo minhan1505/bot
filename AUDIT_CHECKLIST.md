@@ -318,12 +318,31 @@ Output includes the comprehensive markdown benchmark report verifying 0 samples 
 
 ---
 
-## 10. Test Suite Summary
+## 10. QA Follow-up Verification (T01, Commit 8ddce10 / 7cdda7e)
 
-- **Total Automated Tests:** 64 passed (0 failed, 0 skipped).
-  - 49 Unit & Integration Tests (`tests/`)
+### T01 — Outcome Logging Failure Must Preserve True Backend Dispatch Status
+- **Confirmation:** Confirmed.
+- **Root Cause:** In `bot/workflow/runner.py`, when `outcome_ok` was `False`, the runner called `inst.on_action_dispatched()` before inspecting `dispatched.status`. If backend returned `NOT_SENT`, `FAIL_CLOSED`, or `UNCERTAIN`, the state history falsely recorded `ACTION_PENDING` with reason `"Action dispatched"`, updated `last_action_at`, and masked the backend's failure reason.
+- **Files Modified:** [`bot/workflow/runner.py`](file:///D:/xampp/bot/bot/workflow/runner.py), [`tests/test_runner.py`](file:///D:/xampp/bot/tests/test_runner.py).
+- **Fix:** Restructured outcome handling to evaluate backend `ActionDispatchResult` first:
+  - `ActionDispatchStatus.DISPATCHED`: calls `inst.on_action_dispatched()` (`last_action_at > 0`); if `outcome_ok` advances step, else transitions to `SAFE_PAUSE`.
+  - `ActionDispatchStatus.UNCERTAIN`: transitions to `RegionState.UNCERTAIN_HOLD` with backend reason (`last_action_at == 0`); if not `outcome_ok`, transitions to `SAFE_PAUSE`.
+  - `ActionDispatchStatus.FAIL_CLOSED`: transitions to `RegionState.REJECTED` with backend reason (`last_action_at == 0`); if not `outcome_ok`, transitions to `SAFE_PAUSE`.
+  - `ActionDispatchStatus.NOT_SENT`: transitions to `RegionState.WAIT_STEP` (if retry available and `outcome_ok`) or `RegionState.REJECTED` (`last_action_at == 0`); if not `outcome_ok`, transitions to `SAFE_PAUSE` blocking retries.
+- **Counterexample Tests:**
+  - `qa/test_8ddce10_outcome_truth.py::test_failed_outcome_does_not_record_unconfirmed_action_as_dispatched` (**PASSED** for `NOT_SENT`, `FAIL_CLOSED`, `UNCERTAIN`).
+  - `tests/test_runner.py::test_dispatch_status_truth_and_outcome_evidence_matrix` (**PASSED** across all 8 permutations of 4 statuses × 2 evidence outcomes).
+
+---
+
+## 11. Test Suite Summary
+
+- **Total Automated Tests:** 75 passed (0 failed, 0 skipped).
+  - 57 Unit & Integration Tests (`tests/`)
   - 7 Acceptance Counterexample Tests (`qa/test_ae5036a_acceptance.py`)
   - 4 Robustness Counterexample Tests (`qa/test_79168c8_followup.py`)
+  - 3 Outcome Truth Counterexample Tests (`qa/test_8ddce10_outcome_truth.py`)
   - 2 Follow-up Regression Tests (`qa/test_db4d20e_followup.py`)
   - 2 Independent Regression Scenarios (`qa/test_independent_regressions.py`)
+
 

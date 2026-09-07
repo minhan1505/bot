@@ -379,6 +379,7 @@ class BotRuntimeRunner:
 
                                         dispatched = self.action_manager.dispatch_action(screen_x, screen_y, action_context)
 
+                                        outcome_ok = True
                                         if token and self.telemetry:
                                             outcome_data = {
                                                 "region_id": owner_region,
@@ -387,7 +388,6 @@ class BotRuntimeRunner:
                                                 "dispatched": bool(dispatched),
                                                 "timestamp": time.time()
                                             }
-                                            outcome_ok = False
                                             if hasattr(self.telemetry, "consume"):
                                                 outcome_ok = bool(self.telemetry.consume(token, "ACTION_OUTCOME", outcome_data))
                                             elif hasattr(token, "consume"):
@@ -402,39 +402,44 @@ class BotRuntimeRunner:
                                                     self.telemetry.release(token)
                                                 elif hasattr(token, "release"):
                                                     token.release()
-                                                inst.on_action_dispatched()
-                                                inst.transition_to(RegionState.SAFE_PAUSE, reason="Critical ACTION_OUTCOME evidence recording failed")
-                                                if self.on_state_change:
-                                                    self.on_state_change(owner_region, inst.state.value, inst.current_step_index)
-                                                continue
 
                                         # Handle Action Outcome with explicit ActionDispatchResult handling
                                         if isinstance(dispatched, ActionDispatchResult) or hasattr(dispatched, "status"):
                                             status = getattr(dispatched, "status", None)
+                                            reason = getattr(dispatched, "reason", "")
                                             if status == ActionDispatchStatus.UNCERTAIN:
-                                                logger.warning(f"Uncertain action dispatch for Region {owner_region}: {getattr(dispatched, 'reason', '')}")
-                                                inst.transition_to(RegionState.UNCERTAIN_HOLD, reason=getattr(dispatched, "reason", "Action uncertain"))
+                                                logger.warning(f"Uncertain action dispatch for Region {owner_region}: {reason}")
+                                                inst.transition_to(RegionState.UNCERTAIN_HOLD, reason=reason or "Action uncertain")
+                                                if not outcome_ok:
+                                                    inst.transition_to(RegionState.SAFE_PAUSE, reason="Critical ACTION_OUTCOME evidence recording failed")
                                                 if self.on_state_change:
                                                     self.on_state_change(owner_region, inst.state.value, inst.current_step_index)
                                                 continue
                                             elif status == ActionDispatchStatus.FAIL_CLOSED:
-                                                logger.error(f"Fail-closed action dispatch for Region {owner_region}: {getattr(dispatched, 'reason', '')}")
-                                                inst.transition_to(RegionState.REJECTED, reason=getattr(dispatched, "reason", "Action fail-closed"))
+                                                logger.error(f"Fail-closed action dispatch for Region {owner_region}: {reason}")
+                                                inst.transition_to(RegionState.REJECTED, reason=reason or "Action fail-closed")
+                                                if not outcome_ok:
+                                                    inst.transition_to(RegionState.SAFE_PAUSE, reason="Critical ACTION_OUTCOME evidence recording failed")
                                                 if self.on_state_change:
                                                     self.on_state_change(owner_region, inst.state.value, inst.current_step_index)
                                                 continue
                                             elif status == ActionDispatchStatus.NOT_SENT:
-                                                logger.warning(f"Action not sent for Region {owner_region}: {getattr(dispatched, 'reason', '')}")
-                                                if inst.can_attempt_dispatch():
+                                                logger.warning(f"Action not sent for Region {owner_region}: {reason}")
+                                                if inst.can_attempt_dispatch() and outcome_ok:
                                                     inst.transition_to(RegionState.WAIT_STEP, reason="Action not sent; retry available within deadline")
                                                 else:
-                                                    inst.transition_to(RegionState.REJECTED, reason="Action not sent and retry budget exhausted")
+                                                    inst.transition_to(RegionState.REJECTED, reason=f"Action not sent: {reason}" if reason else "Action not sent and retry budget exhausted")
+                                                if not outcome_ok:
+                                                    inst.transition_to(RegionState.SAFE_PAUSE, reason="Critical ACTION_OUTCOME evidence recording failed")
                                                 if self.on_state_change:
                                                     self.on_state_change(owner_region, inst.state.value, inst.current_step_index)
                                                 continue
                                             elif status == ActionDispatchStatus.DISPATCHED:
                                                 inst.on_action_dispatched()
-                                                inst.advance_step()
+                                                if outcome_ok:
+                                                    inst.advance_step()
+                                                else:
+                                                    inst.transition_to(RegionState.SAFE_PAUSE, reason="Critical ACTION_OUTCOME evidence recording failed")
                                                 if self.on_state_change:
                                                     self.on_state_change(owner_region, inst.state.value, inst.current_step_index)
                                                 continue
@@ -442,17 +447,24 @@ class BotRuntimeRunner:
                                         # Generic boolean handling (legacy / mocks)
                                         if bool(dispatched):
                                             inst.on_action_dispatched()
-                                            inst.advance_step()
+                                            if outcome_ok:
+                                                inst.advance_step()
+                                            else:
+                                                inst.transition_to(RegionState.SAFE_PAUSE, reason="Critical ACTION_OUTCOME evidence recording failed")
                                             if self.on_state_change:
                                                 self.on_state_change(owner_region, inst.state.value, inst.current_step_index)
+                                            continue
                                         else:
                                             logger.warning(f"Failed to dispatch action for Region {owner_region}")
-                                            if inst.can_attempt_dispatch():
+                                            if inst.can_attempt_dispatch() and outcome_ok:
                                                 inst.transition_to(RegionState.WAIT_STEP, reason="Dispatch failed; retry available within deadline")
                                             else:
                                                 inst.transition_to(RegionState.REJECTED, reason="Dispatch failed and retry limit reached")
+                                            if not outcome_ok:
+                                                inst.transition_to(RegionState.SAFE_PAUSE, reason="Critical ACTION_OUTCOME evidence recording failed")
                                             if self.on_state_change:
                                                 self.on_state_change(owner_region, inst.state.value, inst.current_step_index)
+                                            continue
                                     else:
                                         # Dry-Run mode: Advance without dispatching
                                         logger.info(f"[DRY-RUN] WOULD_CLICK at ({screen_x}, {screen_y}) for Region {owner_region}")
