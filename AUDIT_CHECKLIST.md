@@ -137,7 +137,7 @@ Please audit the implementation against the following 7 core modules and verific
 
 ## 3. Running the Full Automated Audit Suite
 
-Execute the complete audit test suite covering all 58 audit specifications and QA acceptance regressions:
+Execute the complete audit test suite covering all 62 audit specifications and QA acceptance regressions:
 
 ```powershell
 # From repo root
@@ -146,7 +146,7 @@ python -m pytest tests/ qa/ -v
 
 Expected output:
 ```text
-============================= 58 passed in ~3.2s ==============================
+============================= 62 passed in ~3.3s ==============================
 ```
 
 ---
@@ -255,3 +255,45 @@ Output includes the comprehensive markdown benchmark report verifying 0 samples 
 - **Files Modified:** [`bot/ui/main_window.py`](file:///D:/xampp/bot/bot/ui/main_window.py), [`tests/test_action_and_safety.py`](file:///D:/xampp/bot/tests/test_action_and_safety.py).
 - **Fix:** In `_on_profile_changed` and `_create_new_profile`, dynamically assign `self.action_manager.safety_config = self.active_profile.safety_config` and update rate limiters and circuit breaker thresholds.
 - **Counterexample Test:** `tests/test_action_and_safety.py::test_action_manager_profile_safety_config_synchronization` (**PASSED**).
+
+---
+
+## 7. QA Follow-up Verification (R01 — R04)
+
+### R01 — CDP & Win32 Backends Return Structured UNCERTAIN Status on Partial Send
+- **Confirmation:** Confirmed.
+- **Root Cause:** CDP backend returned `False` when `mousePressed` succeeded but `mouseReleased` failed or lost ACK; Win32 backend also returned `False` if `WM_LBUTTONUP` failed after `WM_LBUTTONDOWN`. Runner only handled `UNCERTAIN` when receiving `ActionDispatchResult`, so boolean `False` was treated as an ordinary failed attempt and retried.
+- **Files Modified:** [`bot/action/cdp_backend.py`](file:///D:/xampp/bot/bot/action/cdp_backend.py), [`bot/action/window_backend.py`](file:///D:/xampp/bot/bot/action/window_backend.py), [`bot/action/manager.py`](file:///D:/xampp/bot/bot/action/manager.py).
+- **Fix:** Both backends now return `ActionDispatchResult(ActionDispatchStatus.UNCERTAIN, reason)` when mouse down succeeded but mouse up failed/timed out. `ActionManager.dispatch_action` returns `ActionDispatchResult` across all safety and dispatch branches.
+- **Counterexample Test:** `qa/test_79168c8_followup.py::test_cdp_partial_send_returns_uncertain_not_retryable_false` (**PASSED**).
+
+### R02 — UNCERTAIN_HOLD Still Obeys Step Deadline
+- **Confirmation:** Confirmed.
+- **Root Cause:** `check_timeout()` in `bot/workflow/state_machine.py` included `RegionState.UNCERTAIN_HOLD` in the ignore tuple along with terminal states (`IDLE`, `DONE`, `TIMEOUT`, `REJECTED`, `SAFE_PAUSE`), allowing a region in `UNCERTAIN_HOLD` to hang indefinitely past its step deadline.
+- **Files Modified:** [`bot/workflow/state_machine.py`](file:///D:/xampp/bot/bot/workflow/state_machine.py).
+- **Fix:** Removed `UNCERTAIN_HOLD` from the terminal ignore set. When `now >= deadline`, `check_timeout()` transitions the instance to `RegionState.TIMEOUT` and returns `True`.
+- **Counterexample Test:** `qa/test_79168c8_followup.py::test_uncertain_hold_still_obeys_step_deadline` (**PASSED**).
+
+### R03 — Telemetry Check-and-Enqueue Atomic Under Lock
+- **Confirmation:** Confirmed.
+- **Root Cause:** In `log_event()`, the capacity check occurred inside `self._lock`, but the lock was released before `self._queue.put_nowait(entry)`. A concurrent action thread reserving capacity between the check and enqueue caused ordinary producers to steal reserved slots. In addition, `_reap_expired_tokens` was called from the writer thread without acquiring lock.
+- **Files Modified:** [`bot/telemetry/logger.py`](file:///D:/xampp/bot/bot/telemetry/logger.py).
+- **Fix:** Changed `self._lock` to `threading.RLock()`. Enclosed `_reap_expired_tokens()` under `self._lock`. In `log_event()`, kept both capacity check and `put_nowait` atomic within `with self._lock:`.
+- **Counterexample Test:** `qa/test_79168c8_followup.py::test_reservation_between_normal_check_and_enqueue_cannot_be_stolen` (**PASSED**).
+
+### R04 — Rejection of Critical ACTION_INTENT Blocks Action Dispatch
+- **Confirmation:** Confirmed.
+- **Root Cause:** In `bot/workflow/runner.py`, `self.telemetry.consume(token, "ACTION_INTENT", ...)` ignored the boolean return value. When token consumption failed (due to token expiry, capacity error, or stalled queue), the action was dispatched anyway.
+- **Files Modified:** [`bot/workflow/runner.py`](file:///D:/xampp/bot/bot/workflow/runner.py).
+- **Fix:** Explicitly checked `intent_ok`. If `intent_ok` is `False`, released token, transitioned instance to `RegionState.SAFE_PAUSE`, and halted dispatch immediately (`continue`). Also guarded `ACTION_OUTCOME` to log and mark evidence incomplete if outcome enqueue fails.
+- **Counterexample Test:** `qa/test_79168c8_followup.py::test_failed_intent_enqueue_blocks_action` (**PASSED**).
+
+---
+
+## 8. Specific Real-World Dependencies & Non-Blocking Scope Breakdown
+
+| Dependency | Current Implementation Status | Missing Real-World Artifact | Blocked Acceptance Item | Unblocked Test Scope |
+| :--- | :--- | :--- | :--- | :--- |
+| **Pretrained Vision Model Weights** | ONNX dynamic dimension inspection, batch L2 normalization, and cosine similarity cache verified. | Official pretrained weights file `models/ui_vision_encoder.onnx` (currently uses random-weight backbone export in dev script). | Real-symbol accuracy benchmark on unseen web/game targets (A1). | Full pipeline execution, proposal engine, escalation, and tri-gate logic. |
+| **Golden Symbol Dataset & Confusers** | Geometry separability guard at crop, mathematical pre-overlap threshold search on $D_{calib}$ / $D_{val}$ enforcing zero false positives. | Real user screen crops of the 19 casino targets and explicit operational confusers (neighboring UI buttons). | Generating final production `calibration.json` profiles with empirical thresholds. | Pre-overlap rejection mathematical validation, geometry verifier, and contour density guards. |
+| **Hardware Staging Multi-Monitor Rig** | Two-tier scheduler, same-frame escalation, live runner loop, CDP WebSocket and Win32 PostMessage background dispatch. | Physical multi-monitor testbed running 19 concurrent Chrome tables at mixed DPI. | Physical 10-minute stationary mouse cursor certification on live browser hardware and live hardware SLA latency (A7, A8). | Algorithmic pipeline latency benchmark ($\le 45\text{ ms} \ll 700\text{ ms}$), memory isolation, and anti-runaway safety guards. |

@@ -354,12 +354,25 @@ class BotRuntimeRunner:
                                                 "screen_pos": (screen_x, screen_y),
                                                 "context": action_context
                                             }
+                                            intent_ok = False
                                             if hasattr(self.telemetry, "consume"):
-                                                self.telemetry.consume(token, "ACTION_INTENT", intent_data)
+                                                intent_ok = bool(self.telemetry.consume(token, "ACTION_INTENT", intent_data))
                                             elif hasattr(token, "consume"):
-                                                token.consume("ACTION_INTENT", intent_data)
+                                                intent_ok = bool(token.consume("ACTION_INTENT", intent_data))
                                             else:
                                                 self.telemetry.log_event("ACTION_INTENT", intent_data)
+                                                intent_ok = True
+
+                                            if not intent_ok:
+                                                logger.error(f"Critical ACTION_INTENT rejected for Region {owner_region}. Halting dispatch with SAFE_PAUSE.")
+                                                if hasattr(self.telemetry, "release"):
+                                                    self.telemetry.release(token)
+                                                elif hasattr(token, "release"):
+                                                    token.release()
+                                                inst.transition_to(RegionState.SAFE_PAUSE, reason="Critical ACTION_INTENT audit recording rejected")
+                                                if self.on_state_change:
+                                                    self.on_state_change(owner_region, inst.state.value, inst.current_step_index)
+                                                continue
 
                                         # Record attempt counter before dispatch
                                         inst.on_action_attempt()
@@ -374,12 +387,21 @@ class BotRuntimeRunner:
                                                 "dispatched": bool(dispatched),
                                                 "timestamp": time.time()
                                             }
+                                            outcome_ok = False
                                             if hasattr(self.telemetry, "consume"):
-                                                self.telemetry.consume(token, "ACTION_OUTCOME", outcome_data)
+                                                outcome_ok = bool(self.telemetry.consume(token, "ACTION_OUTCOME", outcome_data))
                                             elif hasattr(token, "consume"):
-                                                token.consume("ACTION_OUTCOME", outcome_data)
+                                                outcome_ok = bool(token.consume("ACTION_OUTCOME", outcome_data))
                                             else:
                                                 self.telemetry.log_event("ACTION_OUTCOME", outcome_data)
+                                                outcome_ok = True
+
+                                            if not outcome_ok:
+                                                logger.error(f"Critical ACTION_OUTCOME rejected for Region {owner_region}. Marking evidence incomplete.")
+                                                if hasattr(self.telemetry, "release"):
+                                                    self.telemetry.release(token)
+                                                elif hasattr(token, "release"):
+                                                    token.release()
 
                                         # Handle Action Outcome with explicit ActionDispatchResult handling
                                         if isinstance(dispatched, ActionDispatchResult) or hasattr(dispatched, "status"):

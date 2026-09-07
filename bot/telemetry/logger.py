@@ -43,7 +43,7 @@ class AsyncTelemetryLogger:
         self._queue: queue.Queue = queue.Queue(maxsize=maxsize)
         self._stop_event = threading.Event()
         self._dropped_count = 0
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._reserved_slots: int = 0
         self._active_tokens: Dict[str, ReservationToken] = {}
         self._worker_thread = threading.Thread(target=self._writer_loop, daemon=True)
@@ -64,17 +64,18 @@ class AsyncTelemetryLogger:
                     logger.error(f"Error writing telemetry log: {e}")
 
     def _reap_expired_tokens(self, now: Optional[float] = None):
-        if now is None:
-            now = time.monotonic()
-        expired_ids = []
-        for tok_id, tok in self._active_tokens.items():
-            if now >= tok.expires_at:
-                tok.state = "EXPIRED"
-                remaining = tok.slots_reserved - tok.slots_consumed
-                self._reserved_slots = max(0, self._reserved_slots - remaining)
-                expired_ids.append(tok_id)
-        for tok_id in expired_ids:
-            self._active_tokens.pop(tok_id, None)
+        with self._lock:
+            if now is None:
+                now = time.monotonic()
+            expired_ids = []
+            for tok_id, tok in self._active_tokens.items():
+                if now >= tok.expires_at:
+                    tok.state = "EXPIRED"
+                    remaining = tok.slots_reserved - tok.slots_consumed
+                    self._reserved_slots = max(0, self._reserved_slots - remaining)
+                    expired_ids.append(tok_id)
+            for tok_id in expired_ids:
+                self._active_tokens.pop(tok_id, None)
 
     @property
     def maxsize(self) -> int:
@@ -155,23 +156,23 @@ class AsyncTelemetryLogger:
 
     def log_event(self, event_type: str, data: Dict[str, Any]):
         """Non-blocking log submission for non-critical telemetry. Drops if buffer would encroach on reserved slots."""
-        with self._lock:
-            if self._queue.qsize() + self._reserved_slots >= self._maxsize:
-                self._dropped_count += 1
-                return
-
         entry = {
             "event_type": event_type,
             "wall_time": time.time(),
             "monotonic_time": time.perf_counter(),
             "data": data
         }
-        try:
-            self._queue.put_nowait(entry)
-        except queue.Full:
-            self._dropped_count += 1
-            if self._dropped_count % 100 == 1:
-                logger.warning(f"Telemetry queue full! Dropped {self._dropped_count} entries.")
+        with self._lock:
+            self._reap_expired_tokens()
+            if self._queue.qsize() + self._reserved_slots >= self._maxsize:
+                self._dropped_count += 1
+                return
+            try:
+                self._queue.put_nowait(entry)
+            except queue.Full:
+                self._dropped_count += 1
+                if self._dropped_count % 100 == 1:
+                    logger.warning(f"Telemetry queue full! Dropped {self._dropped_count} entries.")
 
     def close(self):
         self._stop_event.set()

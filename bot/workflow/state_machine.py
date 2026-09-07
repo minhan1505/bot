@@ -180,7 +180,7 @@ class RegionInstance:
     def check_timeout(self, now: float) -> bool:
         """Checks if current step has timed out against monotonic/time deadline."""
         step = self.current_step
-        if not step or self.state in (RegionState.IDLE, RegionState.DONE, RegionState.TIMEOUT, RegionState.REJECTED, RegionState.UNCERTAIN_HOLD, RegionState.SAFE_PAUSE):
+        if not step or self.state in (RegionState.IDLE, RegionState.DONE, RegionState.TIMEOUT, RegionState.REJECTED, RegionState.SAFE_PAUSE):
             return False
 
         if self.is_deadline_expired(now):

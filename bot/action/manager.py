@@ -13,7 +13,7 @@ import time
 from typing import Optional, Dict, Any, Tuple
 import logging
 from bot.core.models import SafetyConfig
-from bot.action.base import BaseActionBackend
+from bot.action.base import BaseActionBackend, ActionDispatchResult, ActionDispatchStatus
 from bot.action.cdp_backend import CDPActionBackend
 from bot.action.window_backend import WindowActionBackend
 
@@ -90,32 +90,33 @@ class ActionManager:
         screen_x: int,
         screen_y: int,
         context: Dict[str, Any]
-    ) -> bool:
+    ) -> ActionDispatchResult:
         """
         Safely dispatches action subject to safety guards.
+        Returns ActionDispatchResult distinguishing DISPATCHED, UNCERTAIN, FAIL_CLOSED, NOT_SENT.
         """
         if self.emergency_stop_triggered:
             logger.warning("Action dispatch rejected: Emergency stop active.")
-            return False
+            return ActionDispatchResult(ActionDispatchStatus.FAIL_CLOSED, "Emergency stop active", target_screen_pt=(screen_x, screen_y))
 
         if self._circuit_breaker_tripped:
             logger.warning("Action dispatch rejected: Circuit breaker tripped (Anti-Runaway).")
-            return False
+            return ActionDispatchResult(ActionDispatchStatus.FAIL_CLOSED, "Circuit breaker tripped (Anti-Runaway)", target_screen_pt=(screen_x, screen_y))
 
         if not self.backend or not self.is_supported:
             logger.error("Action dispatch rejected: BACKGROUND_ACTION_UNSUPPORTED. Physical mouse fallback is forbidden.")
-            return False
+            return ActionDispatchResult(ActionDispatchStatus.FAIL_CLOSED, "BACKGROUND_ACTION_UNSUPPORTED", target_screen_pt=(screen_x, screen_y))
 
         # If production mode requested, require surface verification
         if context.get("is_production", False) and not self.is_surface_verified:
             logger.error("Action dispatch rejected: SURFACE_UNVERIFIED_ACTION_BLOCKED. Protocol ACK is not surface verification.")
-            return False
+            return ActionDispatchResult(ActionDispatchStatus.FAIL_CLOSED, "SURFACE_UNVERIFIED_ACTION_BLOCKED", target_screen_pt=(screen_x, screen_y))
 
         # Total click quota check
         if self._total_clicks >= self.safety_config.max_total_clicks:
             logger.critical(f"Total click quota exceeded ({self._total_clicks} >= {self.safety_config.max_total_clicks}). Halting.")
             self._circuit_breaker_tripped = True
-            return False
+            return ActionDispatchResult(ActionDispatchStatus.FAIL_CLOSED, "Total click quota exceeded", target_screen_pt=(screen_x, screen_y))
 
         # Per-region click quota check
         region_id = context.get("region_id")
@@ -123,7 +124,7 @@ class ActionManager:
             reg_clicks = self._region_clicks.get(region_id, 0)
             if reg_clicks >= self.safety_config.max_clicks_per_region:
                 logger.warning(f"Region '{region_id}' click quota exceeded ({reg_clicks} >= {self.safety_config.max_clicks_per_region}). Dropping action.")
-                return False
+                return ActionDispatchResult(ActionDispatchStatus.FAIL_CLOSED, f"Region click quota exceeded for '{region_id}'", target_screen_pt=(screen_x, screen_y))
 
         now = time.time()
 
@@ -131,15 +132,22 @@ class ActionManager:
         clicks_1s = [t for t in self._recent_click_timestamps if now - t < 1.0]
         if len(clicks_1s) >= self.max_clicks_per_sec:
             logger.warning(f"Anti-Runaway triggered: Rate limit exceeded ({len(clicks_1s)} >= {self.max_clicks_per_sec}/sec). Dropping action.")
-            return False
+            return ActionDispatchResult(ActionDispatchStatus.FAIL_CLOSED, "Anti-Runaway rate limit exceeded", target_screen_pt=(screen_x, screen_y))
 
         # Prune circuit breaker window
         cb_window = self.safety_config.circuit_breaker_window_sec
         self._recent_click_timestamps = [t for t in self._recent_click_timestamps if now - t < cb_window]
 
         # Dispatch through verified non-physical backend
-        success = self.backend.dispatch_click(screen_x, screen_y, context)
-        if success:
+        raw_result = self.backend.dispatch_click(screen_x, screen_y, context)
+        if isinstance(raw_result, ActionDispatchResult):
+            result = raw_result
+        elif bool(raw_result):
+            result = ActionDispatchResult(ActionDispatchStatus.DISPATCHED, "Dispatched successfully", target_screen_pt=(screen_x, screen_y))
+        else:
+            result = ActionDispatchResult(ActionDispatchStatus.NOT_SENT, "Backend dispatch returned False", target_screen_pt=(screen_x, screen_y))
+
+        if result.status == ActionDispatchStatus.DISPATCHED:
             self._recent_click_timestamps.append(now)
             self._total_clicks += 1
             if region_id:
@@ -148,7 +156,7 @@ class ActionManager:
                 self._circuit_breaker_tripped = True
                 logger.critical(f"ANTI-RUNAWAY CIRCUIT BREAKER TRIPPED! ({len(self._recent_click_timestamps)} actions in {cb_window} sec). Bot halted.")
 
-        return success
+        return result
 
     @property
     def total_clicks(self) -> int:

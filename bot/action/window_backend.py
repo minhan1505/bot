@@ -11,7 +11,7 @@ import ctypes
 from ctypes import wintypes
 from typing import Tuple, Dict, Any, Optional
 import logging
-from bot.action.base import BaseActionBackend
+from bot.action.base import BaseActionBackend, ActionDispatchResult, ActionDispatchStatus
 from bot.action.cdp_backend import get_physical_cursor_pos
 from bot.core.coordinates import CoordinateMapper, Rect
 
@@ -76,14 +76,15 @@ class WindowActionBackend(BaseActionBackend):
         screen_x: int,
         screen_y: int,
         context: Dict[str, Any]
-    ) -> bool:
+    ) -> ActionDispatchResult:
         """
         Sends WM_LBUTTONDOWN and WM_LBUTTONUP via PostMessage to HWND client area.
+        Returns ActionDispatchResult distinguishing DISPATCHED, NOT_SENT, UNCERTAIN.
         """
         target_hwnd = context.get("hwnd", self.hwnd)
         if not target_hwnd:
             logger.error("Cannot dispatch click: HWND is not configured.")
-            return False
+            return ActionDispatchResult(ActionDispatchStatus.NOT_SENT, "HWND is not configured", target_screen_pt=(screen_x, screen_y))
 
         user32 = ctypes.windll.user32
 
@@ -92,7 +93,7 @@ class WindowActionBackend(BaseActionBackend):
         res_stc = user32.ScreenToClient(wintypes.HWND(target_hwnd), ctypes.byref(pt))
         if res_stc == 0:
             logger.error(f"ScreenToClient failed for HWND {target_hwnd}")
-            return False
+            return ActionDispatchResult(ActionDispatchStatus.NOT_SENT, f"ScreenToClient failed for HWND {target_hwnd}", target_screen_pt=(screen_x, screen_y))
         client_x, client_y = pt.x, pt.y
 
         # Pack into lParam: low-order word = x, high-order word = y
@@ -107,7 +108,7 @@ class WindowActionBackend(BaseActionBackend):
         )
         if res_down == 0:
             logger.error(f"PostMessageW WM_LBUTTONDOWN failed for HWND {target_hwnd}")
-            return False
+            return ActionDispatchResult(ActionDispatchStatus.NOT_SENT, f"PostMessageW WM_LBUTTONDOWN failed for HWND {target_hwnd}", target_screen_pt=(screen_x, screen_y))
 
         time.sleep(0.030) # 30ms click duration
 
@@ -122,10 +123,18 @@ class WindowActionBackend(BaseActionBackend):
             logger.error(f"PostMessageW WM_LBUTTONUP failed for HWND {target_hwnd} after DOWN sent!")
             # 1 recovery attempt
             user32.PostMessageW(wintypes.HWND(target_hwnd), wintypes.UINT(WM_LBUTTONUP), wintypes.WPARAM(0), wintypes.LPARAM(l_param))
-            return False
+            return ActionDispatchResult(
+                ActionDispatchStatus.UNCERTAIN,
+                f"PostMessageW WM_LBUTTONUP failed after DOWN sent for HWND {target_hwnd}",
+                target_screen_pt=(screen_x, screen_y)
+            )
 
         logger.info(f"Win32 background click posted to HWND {target_hwnd} at client ({client_x}, {client_y})")
-        return True
+        return ActionDispatchResult(
+            ActionDispatchStatus.DISPATCHED,
+            f"Win32 background click posted to HWND {target_hwnd}",
+            target_screen_pt=(screen_x, screen_y)
+        )
 
     def close(self):
         self.hwnd = None
