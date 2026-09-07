@@ -19,6 +19,18 @@ class ReservationToken:
     created_at: float = field(default_factory=time.monotonic)
     expires_at: float = 0.0
     state: str = "RESERVED"  # "RESERVED" | "CONSUMED" | "RELEASED" | "EXPIRED"
+    _logger: Any = field(default=None, repr=False)
+
+    def consume(self, event_type: str = "ACTION_EVENT", data: Optional[Dict[str, Any]] = None) -> bool:
+        if self._logger:
+            return self._logger.consume(self, event_type, data or {})
+        self.slots_consumed += 1
+        return True
+
+    def release(self):
+        if self._logger:
+            self._logger.release(self)
+        self.state = "RELEASED"
 
 
 class AsyncTelemetryLogger:
@@ -43,42 +55,50 @@ class AsyncTelemetryLogger:
                 try:
                     self._reap_expired_tokens()
                     entry = self._queue.get(timeout=0.1)
-                    line = json.dumps(entry, ensure_ascii=False) + "\n"
-                    f.write(line)
+                    f.write(json.dumps(entry) + "\n")
                     f.flush()
                     self._queue.task_done()
                 except queue.Empty:
                     continue
-                except Exception as exc:
-                    logger.error(f"Error writing telemetry entry: {exc}")
+                except Exception as e:
+                    logger.error(f"Error writing telemetry log: {e}")
 
-    def _reap_expired_tokens(self):
-        now = time.monotonic()
-        with self._lock:
-            expired_ids = [tid for tid, tok in self._active_tokens.items() if now >= tok.expires_at]
-            for tid in expired_ids:
-                tok = self._active_tokens.pop(tid)
+    def _reap_expired_tokens(self, now: Optional[float] = None):
+        if now is None:
+            now = time.monotonic()
+        expired_ids = []
+        for tok_id, tok in self._active_tokens.items():
+            if now >= tok.expires_at:
+                tok.state = "EXPIRED"
                 remaining = tok.slots_reserved - tok.slots_consumed
                 self._reserved_slots = max(0, self._reserved_slots - remaining)
-                tok.state = "EXPIRED"
-                logger.warning(f"Reclaimed {remaining} slots from expired telemetry reservation {tid}")
+                expired_ids.append(tok_id)
+        for tok_id in expired_ids:
+            self._active_tokens.pop(tok_id, None)
+
+    @property
+    def maxsize(self) -> int:
+        return self._maxsize
 
     def reserve_critical_slots(self, count: int = 2, timeout_sec: float = 2.0) -> Optional[ReservationToken]:
         """
-        Atomically reserves slots in the telemetry buffer before an action is attempted.
-        Returns a ReservationToken if slots were secured, or None if buffer capacity is exhausted.
+        Atomically reserves capacity in the telemetry buffer before an action is dispatched.
         """
+        now = time.monotonic()
         with self._lock:
+            self._reap_expired_tokens(now)
             available = self._maxsize - (self._queue.qsize() + self._reserved_slots)
             if available < count:
                 return None
 
-            now = time.monotonic()
             tok = ReservationToken(
                 token_id=f"res_{uuid.uuid4().hex[:8]}",
                 slots_reserved=count,
+                slots_consumed=0,
+                created_at=now,
                 expires_at=now + timeout_sec,
-                state="RESERVED"
+                state="RESERVED",
+                _logger=self
             )
             self._reserved_slots += count
             self._active_tokens[tok.token_id] = tok
@@ -108,19 +128,19 @@ class AsyncTelemetryLogger:
                 token.state = "CONSUMED"
                 self._active_tokens.pop(token.token_id, None)
 
-        entry = {
-            "event_type": event_type,
-            "wall_time": time.time(),
-            "monotonic_time": time.perf_counter(),
-            "token_id": token.token_id,
-            "data": data
-        }
-        try:
-            self._queue.put_nowait(entry)
-            return True
-        except queue.Full:
-            self._dropped_count += 1
-            return False
+            entry = {
+                "event_type": event_type,
+                "wall_time": time.time(),
+                "monotonic_time": time.perf_counter(),
+                "token_id": token.token_id,
+                "data": data
+            }
+            try:
+                self._queue.put_nowait(entry)
+                return True
+            except queue.Full:
+                self._dropped_count += 1
+                return False
 
     def release(self, token: ReservationToken):
         """
@@ -134,7 +154,12 @@ class AsyncTelemetryLogger:
                 self._active_tokens.pop(token.token_id, None)
 
     def log_event(self, event_type: str, data: Dict[str, Any]):
-        """Non-blocking log submission for non-critical telemetry."""
+        """Non-blocking log submission for non-critical telemetry. Drops if buffer would encroach on reserved slots."""
+        with self._lock:
+            if self._queue.qsize() + self._reserved_slots >= self._maxsize:
+                self._dropped_count += 1
+                return
+
         entry = {
             "event_type": event_type,
             "wall_time": time.time(),

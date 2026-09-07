@@ -22,6 +22,7 @@ class RegionState(str, Enum):
     VERIFIED = "VERIFIED"
     ACTION_PENDING = "ACTION_PENDING"
     UNCERTAIN_HOLD = "UNCERTAIN_HOLD"
+    SAFE_PAUSE = "SAFE_PAUSE"
     DONE = "DONE"
     TIMEOUT = "TIMEOUT"
     REJECTED = "REJECTED"
@@ -166,14 +167,24 @@ class RegionInstance:
             self.step_deadline = now + timeout_sec
             self.transition_to(RegionState.WAIT_STEP, reason=f"Advancing to Step {self.current_step_index + 1}")
 
+    def is_deadline_expired(self, now: Optional[float] = None) -> bool:
+        """Checks if current step deadline has expired."""
+        step = self.current_step
+        if not step:
+            return False
+        if now is None:
+            now = time.time()
+        deadline = self.step_deadline if self.step_deadline > 0 else (self.step_started_at + (step.timeout_ms / 1000.0))
+        return now >= deadline
+
     def check_timeout(self, now: float) -> bool:
         """Checks if current step has timed out against monotonic/time deadline."""
         step = self.current_step
-        if not step or self.state in (RegionState.IDLE, RegionState.DONE, RegionState.TIMEOUT, RegionState.REJECTED):
+        if not step or self.state in (RegionState.IDLE, RegionState.DONE, RegionState.TIMEOUT, RegionState.REJECTED, RegionState.UNCERTAIN_HOLD, RegionState.SAFE_PAUSE):
             return False
 
-        deadline = self.step_deadline if self.step_deadline > 0 else (self.step_started_at + (step.timeout_ms / 1000.0))
-        if now >= deadline:
+        if self.is_deadline_expired(now):
+            deadline = self.step_deadline if self.step_deadline > 0 else (self.step_started_at + (step.timeout_ms / 1000.0))
             self.transition_to(RegionState.TIMEOUT, reason=f"Step {self.current_step_index + 1} timed out ({deadline:.1f} <= {now:.1f})")
             return True
         return False

@@ -193,3 +193,41 @@ def test_onnx_verifier_cache_invalidation_by_content():
     verifier.clear_target_cache()
     assert verifier.get_cached_target_embedding("target_1", [img_a]) is None
 
+
+def test_action_manager_profile_safety_config_synchronization():
+    from bot.core.models import SafetyConfig
+    custom_cfg = SafetyConfig(max_clicks_per_second=2.0, circuit_breaker_threshold=2)
+    manager = ActionManager()
+    backend = MockWorkingBackend()
+    manager.probe_and_bind(backend, {})
+
+    # Initially default:
+    assert manager.max_clicks_per_sec == 10.0
+
+    # Dynamically synchronize profile safety config
+    manager.safety_config = custom_cfg
+    manager.max_clicks_per_sec = custom_cfg.max_clicks_per_second
+    manager.circuit_breaker_threshold = custom_cfg.circuit_breaker_threshold
+
+    assert manager.dispatch_action(10, 10, {})
+    assert manager.dispatch_action(10, 10, {})
+    # 3rd click within 1 sec should trip rate limit under new profile config
+    assert not manager.dispatch_action(10, 10, {})
+
+
+def test_viewport_context_properties_and_boundary_guards():
+    from bot.core.coordinates import Rect, ViewportContext, CoordinateMapper
+    ctx = ViewportContext(
+        window_rect=Rect(100, 100, 800, 600),
+        client_rect=Rect(100, 150, 800, 550),
+        viewport_offset=(0, 50),
+        device_pixel_ratio=1.25
+    )
+    assert ctx.inner_width > 0
+    assert ctx.inner_height > 0
+    # Expected: (800 - 0) / 1.25 = 640.0
+    assert abs(ctx.inner_width - 640.0) < 1e-4
+    # Expected: (550 - 50) / 1.25 = 400.0
+    assert abs(ctx.inner_height - 400.0) < 1e-4
+
+

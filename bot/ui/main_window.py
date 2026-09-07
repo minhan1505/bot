@@ -16,7 +16,10 @@ import os
 import time
 import cv2
 import numpy as np
+import logging
 from typing import Optional, Dict
+
+logger = logging.getLogger(__name__)
 
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QTabWidget,
@@ -306,8 +309,12 @@ class MainWindow(QMainWindow):
             name=f"Profile {prof_id[-4:]}"
         )
         self.db.save_profile(new_prof)
-        self.combo_profiles.addItem(new_prof.name, new_prof.profile_id)
         self.active_profile = new_prof
+        if new_prof.safety_config:
+            self.action_manager.safety_config = new_prof.safety_config
+            self.action_manager.max_clicks_per_sec = new_prof.safety_config.max_clicks_per_second
+            self.action_manager.circuit_breaker_threshold = new_prof.safety_config.circuit_breaker_threshold
+        self.combo_profiles.addItem(new_prof.name, new_prof.profile_id)
 
     def _on_profile_changed(self, index: int):
         if index < 0:
@@ -316,6 +323,10 @@ class MainWindow(QMainWindow):
         if prof_id:
             self.vision_engine.clear_target_cache()
             self.active_profile = self.db.load_profile(prof_id)
+            if self.active_profile and self.active_profile.safety_config:
+                self.action_manager.safety_config = self.active_profile.safety_config
+                self.action_manager.max_clicks_per_sec = self.active_profile.safety_config.max_clicks_per_second
+                self.action_manager.circuit_breaker_threshold = self.active_profile.safety_config.circuit_breaker_threshold
             self._refresh_profile_views()
             self.tray_manager.update_status(
                 is_running=self.runner.is_running if self.runner else False,

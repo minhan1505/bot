@@ -52,6 +52,16 @@ class ViewportContext:
     device_pixel_ratio: float = 1.0 # window.devicePixelRatio
     scroll_offset: Tuple[int, int] = (0, 0)   # window.scrollX, window.scrollY
 
+    @property
+    def inner_width(self) -> float:
+        """Browser content viewport width in CSS pixels."""
+        return max(1.0, (self.client_rect.w - self.viewport_offset[0]) / max(0.1, self.device_pixel_ratio))
+
+    @property
+    def inner_height(self) -> float:
+        """Browser content viewport height in CSS pixels."""
+        return max(1.0, (self.client_rect.h - self.viewport_offset[1]) / max(0.1, self.device_pixel_ratio))
+
 
 class CoordinateMapper:
     """

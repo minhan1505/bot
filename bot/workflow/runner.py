@@ -21,6 +21,7 @@ from bot.vision.engine import VisionEngine
 from bot.workflow.ledger import SessionLedger
 from bot.workflow.scheduler import TwoTierScheduler
 from bot.workflow.state_machine import RegionState
+from bot.action.base import ActionDispatchResult, ActionDispatchStatus
 from bot.action.manager import ActionManager
 from bot.telemetry.logger import AsyncTelemetryLogger
 
@@ -205,13 +206,32 @@ class BotRuntimeRunner:
                             if owner_region:
                                 inst = self.ledger.get_instance(owner_region)
                                 if inst:
+                                    if inst.state != RegionState.WAIT_STEP:
+                                        continue
+
+                                    snapshot_gen = inst.generation
+                                    snapshot_step = inst.current_step_index
+
                                     inst.on_target_detected(expected_target_id, (cand_cx, cand_cy))
+                                    if inst.state != RegionState.TARGET_DETECTED:
+                                        continue
 
                                     # Fresh Verify (FR-053): Re-confirm on a fresh sub-ROI with Tri-Gate Authority
                                     sub_rect = Rect(res.candidate_rect[0], res.candidate_rect[1], res.candidate_rect[2], res.candidate_rect[3])
                                     fresh_crop = None
                                     if hasattr(self.capture_manager, "grab_sub_roi"):
                                         fresh_crop, _ = self.capture_manager.grab_sub_roi(sub_rect)
+
+                                    # Invariant Check: Verify generation and step did not change during grab
+                                    if inst.generation != snapshot_gen or inst.current_step_index != snapshot_step:
+                                        logger.warning(f"Region {owner_region}: Stale generation or step changed during fresh verify grab.")
+                                        continue
+
+                                    # Invariant Check: Verify step deadline did not expire during grab
+                                    if inst.is_deadline_expired():
+                                        logger.warning(f"Region {owner_region}: Step deadline expired during fresh verify grab.")
+                                        inst.transition_to(RegionState.TIMEOUT, reason="Step deadline expired during fresh verify grab")
+                                        continue
 
                                     if fresh_crop is None:
                                         inst.on_fresh_verify_failed("Sub-ROI crop failed on fresh frame")
@@ -257,7 +277,19 @@ class BotRuntimeRunner:
                                         inst.on_fresh_verify_failed(reason)
                                         continue
 
+                                    # Invariant Check: Verify generation, step, and deadline before moving to VERIFIED
+                                    if inst.generation != snapshot_gen or inst.current_step_index != snapshot_step:
+                                        logger.warning(f"Region {owner_region}: Stale generation or step changed before fresh verification commit.")
+                                        continue
+
+                                    if inst.is_deadline_expired():
+                                        logger.warning(f"Region {owner_region}: Step deadline expired after fresh verify tri-gate.")
+                                        inst.transition_to(RegionState.TIMEOUT, reason="Step deadline expired after fresh verify tri-gate")
+                                        continue
+
                                     inst.on_fresh_verified()
+                                    if inst.state != RegionState.VERIFIED:
+                                        continue
 
                                     # Map coordinates with desktop offset
                                     desktop_offset = (0, 0)
@@ -289,6 +321,17 @@ class BotRuntimeRunner:
                                         if self.on_state_change:
                                             self.on_state_change(owner_region, inst.state.value, inst.current_step_index)
                                     elif not self.is_dry_run:
+                                        # Strict Invariant: Check deadline immediately before dispatch
+                                        if inst.is_deadline_expired():
+                                            logger.warning(f"Region {owner_region}: Step deadline expired before action dispatch")
+                                            inst.transition_to(RegionState.TIMEOUT, reason="Step deadline expired before action dispatch")
+                                            continue
+
+                                        # Invariant Check: Verify generation & state immediately before dispatch
+                                        if inst.generation != snapshot_gen or inst.current_step_index != snapshot_step or inst.state != RegionState.VERIFIED:
+                                            logger.warning(f"Region {owner_region}: Generation, step or state mismatch before dispatch.")
+                                            continue
+
                                         if not inst.can_attempt_dispatch():
                                             logger.warning(f"Region {owner_region} exhausted dispatch attempt budget")
                                             inst.transition_to(RegionState.REJECTED, reason="Dispatch retry budget exhausted")
@@ -303,15 +346,20 @@ class BotRuntimeRunner:
                                                 inst.transition_to(RegionState.SAFE_PAUSE, reason="Telemetry buffer full, cannot guarantee audit evidence")
                                                 continue
 
-                                            token.consume()
-                                            self.telemetry.log_event("ACTION_INTENT", {
+                                            intent_data = {
                                                 "region_id": owner_region,
                                                 "step_index": inst.current_step_index,
                                                 "generation": inst.generation,
                                                 "target_id": expected_target_id,
                                                 "screen_pos": (screen_x, screen_y),
                                                 "context": action_context
-                                            })
+                                            }
+                                            if hasattr(self.telemetry, "consume"):
+                                                self.telemetry.consume(token, "ACTION_INTENT", intent_data)
+                                            elif hasattr(token, "consume"):
+                                                token.consume("ACTION_INTENT", intent_data)
+                                            else:
+                                                self.telemetry.log_event("ACTION_INTENT", intent_data)
 
                                         # Record attempt counter before dispatch
                                         inst.on_action_attempt()
@@ -319,16 +367,53 @@ class BotRuntimeRunner:
                                         dispatched = self.action_manager.dispatch_action(screen_x, screen_y, action_context)
 
                                         if token and self.telemetry:
-                                            token.consume()
-                                            self.telemetry.log_event("ACTION_OUTCOME", {
+                                            outcome_data = {
                                                 "region_id": owner_region,
                                                 "step_index": inst.current_step_index,
                                                 "generation": inst.generation,
                                                 "dispatched": bool(dispatched),
                                                 "timestamp": time.time()
-                                            })
+                                            }
+                                            if hasattr(self.telemetry, "consume"):
+                                                self.telemetry.consume(token, "ACTION_OUTCOME", outcome_data)
+                                            elif hasattr(token, "consume"):
+                                                token.consume("ACTION_OUTCOME", outcome_data)
+                                            else:
+                                                self.telemetry.log_event("ACTION_OUTCOME", outcome_data)
 
-                                        if dispatched:
+                                        # Handle Action Outcome with explicit ActionDispatchResult handling
+                                        if isinstance(dispatched, ActionDispatchResult) or hasattr(dispatched, "status"):
+                                            status = getattr(dispatched, "status", None)
+                                            if status == ActionDispatchStatus.UNCERTAIN:
+                                                logger.warning(f"Uncertain action dispatch for Region {owner_region}: {getattr(dispatched, 'reason', '')}")
+                                                inst.transition_to(RegionState.UNCERTAIN_HOLD, reason=getattr(dispatched, "reason", "Action uncertain"))
+                                                if self.on_state_change:
+                                                    self.on_state_change(owner_region, inst.state.value, inst.current_step_index)
+                                                continue
+                                            elif status == ActionDispatchStatus.FAIL_CLOSED:
+                                                logger.error(f"Fail-closed action dispatch for Region {owner_region}: {getattr(dispatched, 'reason', '')}")
+                                                inst.transition_to(RegionState.REJECTED, reason=getattr(dispatched, "reason", "Action fail-closed"))
+                                                if self.on_state_change:
+                                                    self.on_state_change(owner_region, inst.state.value, inst.current_step_index)
+                                                continue
+                                            elif status == ActionDispatchStatus.NOT_SENT:
+                                                logger.warning(f"Action not sent for Region {owner_region}: {getattr(dispatched, 'reason', '')}")
+                                                if inst.can_attempt_dispatch():
+                                                    inst.transition_to(RegionState.WAIT_STEP, reason="Action not sent; retry available within deadline")
+                                                else:
+                                                    inst.transition_to(RegionState.REJECTED, reason="Action not sent and retry budget exhausted")
+                                                if self.on_state_change:
+                                                    self.on_state_change(owner_region, inst.state.value, inst.current_step_index)
+                                                continue
+                                            elif status == ActionDispatchStatus.DISPATCHED:
+                                                inst.on_action_dispatched()
+                                                inst.advance_step()
+                                                if self.on_state_change:
+                                                    self.on_state_change(owner_region, inst.state.value, inst.current_step_index)
+                                                continue
+
+                                        # Generic boolean handling (legacy / mocks)
+                                        if bool(dispatched):
                                             inst.on_action_dispatched()
                                             inst.advance_step()
                                             if self.on_state_change:
@@ -339,6 +424,8 @@ class BotRuntimeRunner:
                                                 inst.transition_to(RegionState.WAIT_STEP, reason="Dispatch failed; retry available within deadline")
                                             else:
                                                 inst.transition_to(RegionState.REJECTED, reason="Dispatch failed and retry limit reached")
+                                            if self.on_state_change:
+                                                self.on_state_change(owner_region, inst.state.value, inst.current_step_index)
                                     else:
                                         # Dry-Run mode: Advance without dispatching
                                         logger.info(f"[DRY-RUN] WOULD_CLICK at ({screen_x}, {screen_y}) for Region {owner_region}")
