@@ -41,10 +41,60 @@ def test_calibration_pre_overlap_rejection():
         EvaluationSample(image=target_img, is_positive=True, label="target_1", session_id="B", device_id="D1")
     ]
 
+    alt_img = make_glyph_image("CROSS")
+
     with pytest.raises(CalibrationOverlapError) as exc_info:
-        calib_engine.calibrate_target("target_1", target_img, d_calib_overlap, d_val)
+        calib_engine.calibrate_target(
+            "target_1", target_img, d_calib_overlap, d_val,
+            alternative_identity_imgs={"alt_1": alt_img}
+        )
 
     assert "CONFIGURATION_REJECTED" in str(exc_info.value)
+
+
+def test_calibration_missing_confusers_rejected():
+    geo_verifier = GeometryVerifier(canonical_size=(64, 64))
+    onnx_verifier = ONNXVerifier(model_path=MODEL_PATH, canonical_size=(64, 64))
+    calib_engine = CalibrationEngine(geo_verifier, onnx_verifier, canonical_size=(64, 64))
+
+    target_img = make_glyph_image("CHECK")
+    alt_img = make_glyph_image("CROSS")
+    d_calib = [
+        EvaluationSample(image=target_img, is_positive=True, label="target_1", session_id="A", device_id="D1"),
+        EvaluationSample(image=alt_img, is_positive=False, label="neg_1", session_id="A", device_id="D1"),
+    ]
+    d_val = [
+        EvaluationSample(image=target_img, is_positive=True, label="target_1", session_id="B", device_id="D1"),
+        EvaluationSample(image=alt_img, is_positive=False, label="neg_1", session_id="B", device_id="D1"),
+    ]
+
+    with pytest.raises(CalibrationOverlapError) as exc_info:
+        calib_engine.calibrate_target("target_1", target_img, d_calib, d_val, alternative_identity_imgs=None)
+
+    assert "CALIBRATION_BLOCKED_MISSING_CONFUSERS" in str(exc_info.value)
+
+
+def test_calibration_data_leakage_rejected():
+    geo_verifier = GeometryVerifier(canonical_size=(64, 64))
+    onnx_verifier = ONNXVerifier(model_path=MODEL_PATH, canonical_size=(64, 64))
+    calib_engine = CalibrationEngine(geo_verifier, onnx_verifier, canonical_size=(64, 64))
+
+    target_img = make_glyph_image("CHECK")
+    alt_img = make_glyph_image("CROSS")
+    # Same session "A" in both calib and val
+    d_calib = [
+        EvaluationSample(image=target_img, is_positive=True, label="target_1", session_id="A", device_id="D1"),
+        EvaluationSample(image=alt_img, is_positive=False, label="neg_1", session_id="A", device_id="D1"),
+    ]
+    d_val = [
+        EvaluationSample(image=target_img, is_positive=True, label="target_1", session_id="A", device_id="D1"),
+        EvaluationSample(image=alt_img, is_positive=False, label="neg_1", session_id="A", device_id="D1"),
+    ]
+
+    with pytest.raises(CalibrationOverlapError) as exc_info:
+        calib_engine.calibrate_target("target_1", target_img, d_calib, d_val, alternative_identity_imgs={"alt_1": alt_img})
+
+    assert "DATA_LEAKAGE_DETECTED" in str(exc_info.value)
 
 
 def test_tri_condition_authority_rejects_different_symbol_with_same_color():

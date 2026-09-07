@@ -79,15 +79,31 @@ class ProfileBundleManager:
                 profile_dict = json.loads(raw_json)
                 profile = Profile.model_validate(profile_dict)
 
+                # Security Check: Validate profile_id format to prevent directory traversal or collision
+                import re
+                if not re.match(r'^[a-zA-Z0-9_-]+$', profile.profile_id) or len(profile.profile_id) > 64:
+                    return None, f"SECURITY_ERROR: Invalid profile_id '{profile.profile_id}'. Must strictly match ^[a-zA-Z0-9_-]+$."
+
+                dest_canonical = os.path.realpath(dest_targets_dir)
+
                 # 2. Extract target images and remap local paths
                 for t_id, target in profile.targets.items():
+                    # Validate t_id format as well
+                    if not re.match(r'^[a-zA-Z0-9_-]+$', t_id) or len(t_id) > 64:
+                        return None, f"SECURITY_ERROR: Invalid target_id '{t_id}'."
+
                     new_ref_paths = []
                     for idx in range(len(target.reference_image_paths)):
                         for ext in [".png", ".jpg", ".bmp"]:
                             arc_candidate = f"targets/{t_id}_{idx}{ext}"
                             if arc_candidate in zf.namelist():
                                 local_filename = f"{profile.profile_id}_{t_id}_{idx}{ext}"
-                                local_path = os.path.join(dest_targets_dir, local_filename)
+                                local_path = os.path.realpath(os.path.join(dest_targets_dir, local_filename))
+
+                                # Path Traversal Verification using normalized canonical path
+                                if os.path.commonpath([dest_canonical, local_path]) != dest_canonical:
+                                    return None, f"SECURITY_ERROR: Path traversal detected: {local_path}"
+
                                 with open(local_path, "wb") as f_out:
                                     f_out.write(zf.read(arc_candidate))
                                 new_ref_paths.append(local_path)

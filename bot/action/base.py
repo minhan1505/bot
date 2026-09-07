@@ -9,7 +9,31 @@ Hard Invariant:
 """
 
 from abc import ABC, abstractmethod
-from typing import Tuple, Dict, Any
+from enum import Enum
+from dataclasses import dataclass
+from typing import Tuple, Dict, Any, Optional
+
+
+class ActionDispatchStatus(str, Enum):
+    DISPATCHED = "DISPATCHED"        # Down and Up completed with verified ACK
+    NOT_SENT = "NOT_SENT"            # Failed before sending (dead HWND, out of bounds, etc.)
+    UNCERTAIN = "UNCERTAIN"          # Sent down but up failed / ACK lost
+    FAIL_CLOSED = "FAIL_CLOSED"      # Blocked by safety (breaker, rate limit, probe status, emergency stop)
+
+
+@dataclass
+class ActionDispatchResult:
+    status: ActionDispatchStatus
+    reason: str = ""
+    target_screen_pt: Tuple[int, int] = (0, 0)
+    viewport_css_pt: Optional[Tuple[float, float]] = None
+
+    @property
+    def is_success(self) -> bool:
+        return self.status == ActionDispatchStatus.DISPATCHED
+
+    def __bool__(self) -> bool:
+        return self.is_success
 
 
 class BaseActionBackend(ABC):

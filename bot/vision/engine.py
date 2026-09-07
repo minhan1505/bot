@@ -71,20 +71,20 @@ class VisionEngine:
                 f"Expected model SHA-256 {calibration.model_sha256[:8]}, active is {self.onnx_verifier.model_sha256[:8]}. Recalibration required."
             )
 
-        # Ensure target embedding is cached
-        target_emb = self.onnx_verifier.get_cached_target_embedding(target.target_id)
+        # Ensure target embedding is cached with content validation
+        target_emb = self.onnx_verifier.get_cached_target_embedding(target.target_id, [target_reference_img])
         if target_emb is None:
             self.onnx_verifier.cache_target_embedding(target.target_id, [target_reference_img])
-            target_emb = self.onnx_verifier.get_cached_target_embedding(target.target_id)
+            target_emb = self.onnx_verifier.get_cached_target_embedding(target.target_id, [target_reference_img])
 
-        # Cache alternative identity embeddings
+        # Cache alternative identity embeddings with content validation
         alt_embs: Dict[str, np.ndarray] = {}
         if alternative_targets:
             for alt_id, alt_img in alternative_targets.items():
-                a_emb = self.onnx_verifier.get_cached_target_embedding(alt_id)
+                a_emb = self.onnx_verifier.get_cached_target_embedding(alt_id, [alt_img])
                 if a_emb is None:
                     self.onnx_verifier.cache_target_embedding(alt_id, [alt_img])
-                    a_emb = self.onnx_verifier.get_cached_target_embedding(alt_id)
+                    a_emb = self.onnx_verifier.get_cached_target_embedding(alt_id, [alt_img])
                 alt_embs[alt_id] = a_emb
 
         # Step 1: Crop all candidate regions from frame
@@ -182,3 +182,7 @@ class VisionEngine:
             results.append(res)
 
         return results
+
+    def clear_target_cache(self):
+        """Invalidates all cached target embeddings."""
+        self.onnx_verifier.clear_target_cache()

@@ -120,16 +120,40 @@ class CDPActionBackend(BaseActionBackend):
         viewport_ctx: Optional[ViewportContext] = context.get("viewport_context")
         if viewport_ctx:
             css_x, css_y = CoordinateMapper.screen_to_css_pixels(screen_x, screen_y, viewport_ctx)
+            # Strict boundary check
+            if not (0 <= css_x < viewport_ctx.inner_width and 0 <= css_y < viewport_ctx.inner_height):
+                logger.error(f"Coordinates ({css_x}, {css_y}) out of viewport bounds ({viewport_ctx.inner_width}x{viewport_ctx.inner_height})")
+                return False
         else:
-            # Assume 1:1 if no context
             css_x, css_y = float(screen_x), float(screen_y)
 
-        async def _send_click():
+        async def _recv_ack(ws, expected_id: int, timeout_sec: float = 0.100) -> bool:
+            deadline = asyncio.get_event_loop().time() + timeout_sec
+            while True:
+                remaining = deadline - asyncio.get_event_loop().time()
+                if remaining <= 0:
+                    logger.error(f"CDP ACK timeout for msg {expected_id}")
+                    return False
+                try:
+                    raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
+                    msg = json.loads(raw)
+                    if msg.get("id") == expected_id:
+                        if "error" in msg:
+                            logger.error(f"CDP command {expected_id} returned error: {msg['error']}")
+                            return False
+                        return True
+                    # Discard other asynchronous events from page
+                except Exception as err:
+                    logger.error(f"CDP recv error: {err}")
+                    return False
+
+        async def _send_click() -> bool:
             async with websockets.connect(self.ws_url, close_timeout=1.0) as ws:
                 # 1. mousePressed
                 self._msg_id += 1
+                press_id = self._msg_id
                 press_msg = {
-                    "id": self._msg_id,
+                    "id": press_id,
                     "method": "Input.dispatchMouseEvent",
                     "params": {
                         "type": "mousePressed",
@@ -140,15 +164,17 @@ class CDPActionBackend(BaseActionBackend):
                     }
                 }
                 await ws.send(json.dumps(press_msg))
-                await ws.recv()
+                if not await _recv_ack(ws, press_id):
+                    return False
 
                 # Short inter-event delay (30ms)
                 await asyncio.sleep(0.030)
 
                 # 2. mouseReleased
                 self._msg_id += 1
+                release_id = self._msg_id
                 release_msg = {
-                    "id": self._msg_id,
+                    "id": release_id,
                     "method": "Input.dispatchMouseEvent",
                     "params": {
                         "type": "mouseReleased",
@@ -159,12 +185,18 @@ class CDPActionBackend(BaseActionBackend):
                     }
                 }
                 await ws.send(json.dumps(release_msg))
-                await ws.recv()
+                if not await _recv_ack(ws, release_id):
+                    # Attempt 1 emergency recovery release to clear stuck state
+                    await ws.send(json.dumps(release_msg))
+                    return False
+
+                return True
 
         try:
-            asyncio.run(_send_click())
-            logger.info(f"CDP background click dispatched at CSS ({css_x:.1f}, {css_y:.1f})")
-            return True
+            success = asyncio.run(_send_click())
+            if success:
+                logger.info(f"CDP background click dispatched at CSS ({css_x:.1f}, {css_y:.1f})")
+            return success
         except Exception as e:
             logger.error(f"Failed to dispatch CDP click: {e}")
             return False

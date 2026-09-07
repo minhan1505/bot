@@ -41,6 +41,7 @@ class BotRuntimeRunner:
         ledger: SessionLedger,
         telemetry_logger: Optional[AsyncTelemetryLogger] = None,
         is_dry_run: bool = False,
+        is_production: bool = False,
         on_decision_callback: Optional[Callable[[DecisionResult], None]] = None,
         on_state_callback: Optional[Callable[[str, str, int], None]] = None
     ):
@@ -51,6 +52,7 @@ class BotRuntimeRunner:
         self.ledger = ledger
         self.telemetry = telemetry_logger
         self.is_dry_run = is_dry_run
+        self.is_production = is_production
         self.on_decision = on_decision_callback
         self.on_state_change = on_state_callback
 
@@ -160,9 +162,27 @@ class BotRuntimeRunner:
                     if ref_img is None:
                         continue
 
-                    decisions = self.vision_engine.evaluate_candidates(
-                        frame, region_candidates, target_cfg, ref_img
-                    )
+                    # Collect competitor targets for Gate 3 Margin evaluation
+                    alt_targets = {}
+                    for other_id, other_cfg in self.profile.targets.items():
+                        if other_id != expected_target_id and other_cfg.reference_image_paths:
+                            alt_img = cv2.imread(other_cfg.reference_image_paths[0])
+                            if alt_img is not None:
+                                alt_targets[other_id] = alt_img
+
+                    try:
+                        if alt_targets:
+                            decisions = self.vision_engine.evaluate_candidates(
+                                frame, region_candidates, target_cfg, ref_img, alt_targets
+                            )
+                        else:
+                            decisions = self.vision_engine.evaluate_candidates(
+                                frame, region_candidates, target_cfg, ref_img
+                            )
+                    except TypeError:
+                        decisions = self.vision_engine.evaluate_candidates(
+                            frame, region_candidates, target_cfg, ref_img
+                        )
 
                     for res in decisions:
                         self.total_evaluations += 1
@@ -187,40 +207,144 @@ class BotRuntimeRunner:
                                 if inst:
                                     inst.on_target_detected(expected_target_id, (cand_cx, cand_cy))
 
-                                    # Fresh Verify (FR-053): Re-confirm on a fresh sub-ROI
+                                    # Fresh Verify (FR-053): Re-confirm on a fresh sub-ROI with Tri-Gate Authority
                                     sub_rect = Rect(res.candidate_rect[0], res.candidate_rect[1], res.candidate_rect[2], res.candidate_rect[3])
-                                    fresh_crop, _ = self.capture_manager.grab_sub_roi(sub_rect)
+                                    fresh_crop = None
+                                    if hasattr(self.capture_manager, "grab_sub_roi"):
+                                        fresh_crop, _ = self.capture_manager.grab_sub_roi(sub_rect)
 
-                                    if fresh_crop is not None:
-                                        # Fast geometry confirmation on fresh frame
+                                    if fresh_crop is None:
+                                        inst.on_fresh_verify_failed("Sub-ROI crop failed on fresh frame")
+                                        continue
+
+                                    # Fast tri-condition confirmation on fresh frame
+                                    g_fresh = 1.0
+                                    if hasattr(self.vision_engine, "geo_verifier") and self.vision_engine.geo_verifier is not None:
                                         g_fresh = self.vision_engine.geo_verifier.compute_geometry_score(fresh_crop, ref_img)
-                                        if g_fresh >= (target_cfg.calibration.t_g if target_cfg.calibration else 0.5):
-                                            inst.on_fresh_verified()
 
-                                            step = inst.current_step
-                                            if step and step.action_type == ActionType.DETECT_ONLY:
-                                                # DETECT_ONLY: Advance without physical dispatch
-                                                logger.info(f"[DETECT_ONLY] Target '{expected_target_id}' detected for Region {owner_region}")
-                                                inst.on_action_dispatched()
-                                                inst.advance_step()
-                                                if self.on_state_change:
-                                                    self.on_state_change(owner_region, inst.state.value, inst.current_step_index)
-                                            elif not self.is_dry_run:
-                                                dispatched = self.action_manager.dispatch_action(cand_cx, cand_cy, {})
-                                                if dispatched:
-                                                    inst.on_action_dispatched()
-                                                    inst.advance_step()
-                                                    if self.on_state_change:
-                                                        self.on_state_change(owner_region, inst.state.value, inst.current_step_index)
-                                                else:
-                                                    logger.warning(f"Failed to dispatch action for Region {owner_region} - retrying")
-                                                    inst.transition_to(RegionState.WAIT_STEP, reason="Dispatch failed; retrying")
+                                    calib = target_cfg.calibration
+                                    t_g = calib.t_g if calib else 0.5
+                                    t_e = calib.t_e if calib else 0.65
+                                    m_safe = calib.m_safe if calib else 0.05
+
+                                    geo_fresh_pass = (g_fresh >= t_g)
+
+                                    emb_fresh_pass = True
+                                    margin_fresh_pass = True
+
+                                    if hasattr(self.vision_engine, "onnx_verifier") and self.vision_engine.onnx_verifier is not None:
+                                        fresh_emb = self.vision_engine.onnx_verifier.compute_embeddings([fresh_crop])[0]
+                                        target_emb = self.vision_engine.onnx_verifier.get_cached_target_embedding(expected_target_id, [ref_img])
+                                        e_fresh = self.vision_engine.onnx_verifier.cosine_similarity(fresh_emb, target_emb) if target_emb is not None else 0.0
+                                        emb_fresh_pass = (e_fresh >= t_e)
+
+                                        if alt_targets:
+                                            competitor_scores = [
+                                                self.vision_engine.onnx_verifier.cosine_similarity(
+                                                    fresh_emb,
+                                                    self.vision_engine.onnx_verifier.get_cached_target_embedding(aid, [aimg])
+                                                )
+                                                for aid, aimg in alt_targets.items()
+                                                if self.vision_engine.onnx_verifier.get_cached_target_embedding(aid, [aimg]) is not None
+                                            ]
+                                            if competitor_scores:
+                                                best_comp = max(competitor_scores)
+                                                margin_fresh_pass = ((e_fresh - best_comp) >= m_safe)
+
+                                    if not (geo_fresh_pass and emb_fresh_pass and margin_fresh_pass):
+                                        reason = f"Fresh verify tri-gate failed: G={g_fresh:.3f}/{t_g}"
+                                        logger.warning(f"Region {owner_region}: {reason}")
+                                        inst.on_fresh_verify_failed(reason)
+                                        continue
+
+                                    inst.on_fresh_verified()
+
+                                    # Map coordinates with desktop offset
+                                    desktop_offset = (0, 0)
+                                    if hasattr(self.capture_manager, "get_desktop_offset"):
+                                        desktop_offset = self.capture_manager.get_desktop_offset()
+
+                                    screen_x = cand_cx + desktop_offset[0]
+                                    screen_y = cand_cy + desktop_offset[1]
+
+                                    backend = getattr(self.action_manager, "backend", None)
+                                    action_context = {
+                                        "hwnd": getattr(backend, "hwnd", None),
+                                        "region_id": owner_region,
+                                        "workflow_id": inst.workflow.workflow_id,
+                                        "step_index": inst.current_step_index,
+                                        "generation": inst.generation,
+                                        "timestamp": time.time(),
+                                        "desktop_offset": desktop_offset,
+                                        "viewport_context": getattr(backend, "viewport_context", None),
+                                        "is_production": self.is_production,
+                                    }
+
+                                    step = inst.current_step
+                                    if step and step.action_type == ActionType.DETECT_ONLY:
+                                        # DETECT_ONLY: Advance without physical dispatch
+                                        logger.info(f"[DETECT_ONLY] Target '{expected_target_id}' detected for Region {owner_region}")
+                                        inst.on_action_dispatched()
+                                        inst.advance_step()
+                                        if self.on_state_change:
+                                            self.on_state_change(owner_region, inst.state.value, inst.current_step_index)
+                                    elif not self.is_dry_run:
+                                        if not inst.can_attempt_dispatch():
+                                            logger.warning(f"Region {owner_region} exhausted dispatch attempt budget")
+                                            inst.transition_to(RegionState.REJECTED, reason="Dispatch retry budget exhausted")
+                                            continue
+
+                                        # Telemetry critical reservation
+                                        token = None
+                                        if self.telemetry:
+                                            token = self.telemetry.reserve_critical_slots(count=2)
+                                            if token is None:
+                                                logger.error(f"Telemetry buffer full. SAFE_PAUSE triggered for Region {owner_region}")
+                                                inst.transition_to(RegionState.SAFE_PAUSE, reason="Telemetry buffer full, cannot guarantee audit evidence")
+                                                continue
+
+                                            token.consume()
+                                            self.telemetry.log_event("ACTION_INTENT", {
+                                                "region_id": owner_region,
+                                                "step_index": inst.current_step_index,
+                                                "generation": inst.generation,
+                                                "target_id": expected_target_id,
+                                                "screen_pos": (screen_x, screen_y),
+                                                "context": action_context
+                                            })
+
+                                        # Record attempt counter before dispatch
+                                        inst.on_action_attempt()
+
+                                        dispatched = self.action_manager.dispatch_action(screen_x, screen_y, action_context)
+
+                                        if token and self.telemetry:
+                                            token.consume()
+                                            self.telemetry.log_event("ACTION_OUTCOME", {
+                                                "region_id": owner_region,
+                                                "step_index": inst.current_step_index,
+                                                "generation": inst.generation,
+                                                "dispatched": bool(dispatched),
+                                                "timestamp": time.time()
+                                            })
+
+                                        if dispatched:
+                                            inst.on_action_dispatched()
+                                            inst.advance_step()
+                                            if self.on_state_change:
+                                                self.on_state_change(owner_region, inst.state.value, inst.current_step_index)
+                                        else:
+                                            logger.warning(f"Failed to dispatch action for Region {owner_region}")
+                                            if inst.can_attempt_dispatch():
+                                                inst.transition_to(RegionState.WAIT_STEP, reason="Dispatch failed; retry available within deadline")
                                             else:
-                                                # Dry-Run mode: Advance without dispatching
-                                                logger.info(f"[DRY-RUN] WOULD_CLICK at ({cand_cx}, {cand_cy}) for Region {owner_region}")
-                                                inst.advance_step()
-                                                if self.on_state_change:
-                                                    self.on_state_change(owner_region, inst.state.value, inst.current_step_index)
+                                                inst.transition_to(RegionState.REJECTED, reason="Dispatch failed and retry limit reached")
+                                    else:
+                                        # Dry-Run mode: Advance without dispatching
+                                        logger.info(f"[DRY-RUN] WOULD_CLICK at ({screen_x}, {screen_y}) for Region {owner_region}")
+                                        inst.advance_step()
+                                        if self.on_state_change:
+                                            self.on_state_change(owner_region, inst.state.value, inst.current_step_index)
 
             # Precise pacing
             t_elapsed = time.perf_counter() - t_cycle_start

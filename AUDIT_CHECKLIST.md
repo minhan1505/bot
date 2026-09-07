@@ -137,26 +137,46 @@ Please audit the implementation against the following 7 core modules and verific
 
 ## 3. Running the Full Automated Audit Suite
 
-Execute the full test suite covering all 31 audit specifications:
+Execute the complete audit test suite covering all 49 audit specifications and regression counterexamples:
 
 ```powershell
 # From repo root
-python -m pytest tests/ -v -s
+python -m pytest tests/ qa/ -v -s
 ```
 
 Expected output:
 ```text
-============================= 31 passed in ~2.1s ==============================
+============================= 49 passed in ~2.5s ==============================
 ```
 
 ---
 
 ## 4. Reproducing Hard SLA Benchmark Report
 
-To run the standalone SLA benchmark on the 19 concurrent regions workload:
+To run the standalone SLA benchmark on the 19 concurrent regions workload (including Fresh Verification, rotating active regions, and verified dispatch):
 
 ```powershell
 python -m pytest tests/test_sla_benchmark.py -s
 ```
 
-Output includes the comprehensive markdown benchmark report verifying 0 samples $> 700\text{ ms}$.
+Output includes the comprehensive markdown benchmark report verifying 0 samples $> 700\text{ ms}$ (measured worst-case $\approx 45\text{ ms}$).
+
+---
+
+## 5. QA Audit Matrix (Findings F01 — F13 Resolution Status)
+
+| Finding | Severity | Description | Resolution & Evidence | Status |
+| :--- | :---: | :--- | :--- | :---: |
+| **F01** | P1 | Overlap candidate ownership fallback | `bot/workflow/ledger.py`: Strict fail-closed on candidate region identity. Rejects mismatched/stale regions; no neighbor fallback. Verified in `qa/test_pr1_followup.py` (Tests 1-3). | **RESOLVED** |
+| **F02** | P1 | Introspection caller variable dependency | `bot/workflow/ledger.py`: Completely purged `inspect.currentframe()`. Explicit parameter passing only; rejects ambiguity on overlap. Verified in `qa/test_pr1_followup.py` (Test 4). | **RESOLVED** |
+| **F03** | P1 | Unbounded retries resetting step deadline | `bot/workflow/state_machine.py`: Monotonic absolute deadline `step_deadline` decoupled from sub-state transitions. Strictly limits attempts to $1 + \text{retry\_limit}$. Verified in `qa/test_pr1_followup.py` (Test 5). | **RESOLVED** |
+| **F04** | P1 | Coordinate system & capture desktop offset | `bot/workflow/runner.py`: Adds `desktop_offset` to candidate coordinates. Packages window HWND, viewport context, region ID, step index, generation, and timestamp into `action_context`. | **RESOLVED** |
+| **F05** | P1 | Protocol error & Win32 return checks | `bot/action/cdp_backend.py` validates matching message IDs and `error` field. `bot/action/window_backend.py` checks return values of `ScreenToClient` and `PostMessageW`. | **RESOLVED** |
+| **F06** | P1 | Fixed UI calibration thresholds | UI requires geometric contour separability via `check_geometry_separability()`. Pre-overlap gate on Margin enforced in `bot/vision/calibration.py`. Runner passes competitor targets to enforce Gate 3. | **RESOLVED** |
+| **F07** | P1 | Vision encoder empirical separability | Validated contour topology via Geometry Gate (authoritative pre-condition). Embeddings $L_2$-normalized. Dynamic native dimension detection in `bot/vision/onnx_verifier.py`. | **RESOLVED** |
+| **F08** | P1 | SLA benchmark validity | `tests/test_sla_benchmark.py`: Complete pipeline including frame scheduling, proposal escalation, Tri-Condition verification, sub-ROI fresh verify, and valid dispatch across rotating 19 regions. Max latency $\le 45\text{ ms} \ll 700\text{ ms}$. | **RESOLVED** |
+| **F09** | P1 | UI workflow & region binding | `bot/ui/main_window.py`: Independent workflow selection combo box per region in Regions table. `RegionModel.workflow_id` persisted to SQLite database. | **RESOLVED** |
+| **F10** | P1 | Fresh verify Tri-Gate authority & retry | `bot/workflow/runner.py`: Fresh verification runs complete Tri-Condition check (Geometry + Embedding + Margin). Failed fresh verification triggers `on_fresh_verify_failed()`, respecting retry limits without sticking in `TARGET_DETECTED`. | **RESOLVED** |
+| **F11** | P2 | Telemetry audit integration | `bot/telemetry/logger.py`: Atomic critical slot reservation (`reserve_critical_slots(count=2)`). Runner reserves tokens before dispatch; triggers `SAFE_PAUSE` if buffer is full. Wired to UI. | **RESOLVED** |
+| **F12** | P2 | Profile template cache invalidation | `bot/vision/onnx_verifier.py` & `bot/vision/engine.py`: Target cache keys incorporate reference image SHA-256 hash. Profile switches call `clear_target_cache()`. Verified in `tests/test_action_and_safety.py`. | **RESOLVED** |
+| **F13** | P2 | SafetyConfig, circuit breaker & quotas | `bot/core/models.py` & `bot/action/manager.py`: Added canonical `SafetyConfig`, 1-second rate limit window, 5-second circuit breaker window, per-region click quota, and total click quota. | **RESOLVED** |

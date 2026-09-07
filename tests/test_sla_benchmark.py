@@ -56,7 +56,7 @@ def test_hard_sla_supported_workload_19_regions():
     vision_engine = VisionEngine(onnx_verifier, geo_verifier, proposal_engine)
 
     action_backend = SimulatedInstantActionBackend()
-    action_manager = ActionManager()
+    action_manager = ActionManager(max_clicks_per_second=1000.0, circuit_breaker_threshold=1000)
     action_manager.probe_and_bind(action_backend, {})
 
     # 2. Setup Target & Calibration
@@ -93,59 +93,109 @@ def test_hard_sla_supported_workload_19_regions():
         if i < 4:
             screen_frame[ry+50:ry+98, rx+50:rx+98] = target_img
 
-    # 4. Benchmark Execution Loop (N = 25 iterations)
+    # 4. Benchmark Execution Loop (N = 25 iterations with rotating active target regions)
     latencies = []
     stage_breakdowns = []
     n_iterations = 25
+    expected_dispatches = 0
+    successful_dispatches = 0
 
     for iteration in range(n_iterations):
-        t_start = time.perf_counter()
+        # Reset all regions to fresh WAIT_STEP state
+        for r_id, inst in ledger.get_all_instances().items():
+            inst.start_workflow()
 
-        # Stage A: Scheduling
-        t0 = time.perf_counter()
-        scheduled_regions = scheduler.select_regions_for_frame(ledger.get_all_instances())
-        t_sched = (time.perf_counter() - t0) * 1000.0
+        # Place target in a rotating region for this cycle
+        active_idx = iteration % 19
+        active_rid = f"table_{active_idx + 1}"
+        active_cfg = regions_cfg[active_rid]
 
-        # Stage B: Candidate Proposal across scheduled regions
-        t0 = time.perf_counter()
-        proposals_by_region = {}
-        for r_id, expected_target_id in scheduled_regions:
-            cfg = regions_cfg[r_id]
-            crop = screen_frame[cfg.y:cfg.y + cfg.h, cfg.x:cfg.x + cfg.w]
-            props = proposal_engine.generate_proposals_for_region(
-                crop, Rect(cfg.x, cfg.y, cfg.w, cfg.h), target_img, r_id
-            )
-            if props:
-                proposals_by_region[r_id] = props
+        # Reset screen frame and place target
+        screen_frame.fill(0)
+        screen_frame[active_cfg.y+50:active_cfg.y+98, active_cfg.x+50:active_cfg.x+98] = target_img
+        first_visible_time = time.perf_counter()
+        expected_dispatches += 1
 
-        candidates, diag = proposal_engine.apply_same_frame_escalation(proposals_by_region)
-        t_proposal = (time.perf_counter() - t0) * 1000.0
+        dispatch_success = False
+        t_sched_total = 0.0
+        t_prop_total = 0.0
+        t_veri_total = 0.0
+        t_fv_total = 0.0
+        t_disp_total = 0.0
 
-        # Stage C: Tri-Condition Verification (Geometry + ONNX Batch)
-        t0 = time.perf_counter()
-        decisions = vision_engine.evaluate_candidates(screen_frame, candidates, target, target_img)
-        t_verify = (time.perf_counter() - t0) * 1000.0
+        # Run frame cycles (up to 5 frames at 60fps) until Two-Tier Scheduler picks the active region
+        for frame_cycle in range(5):
+            # Stage A: Scheduling
+            t0 = time.perf_counter()
+            scheduled_regions = scheduler.select_regions_for_frame(ledger.get_all_instances())
+            t_sched_total += (time.perf_counter() - t0) * 1000.0
 
-        # Stage D: Association & Action Dispatch
-        t0 = time.perf_counter()
-        for res in decisions:
-            if res.decision.value == "MATCH":
-                owner_region = ledger.associate_candidate(res.candidate_rect[0], res.candidate_rect[1], target.target_id)
-                if owner_region:
-                    action_manager.dispatch_action(res.candidate_rect[0], res.candidate_rect[1], {})
-                    ledger.advance_region(owner_region)
-        t_dispatch = (time.perf_counter() - t0) * 1000.0
+            # Stage B: Candidate Proposal across scheduled regions
+            t0 = time.perf_counter()
+            proposals_by_region = {}
+            for r_id, expected_target_id in scheduled_regions:
+                cfg = regions_cfg[r_id]
+                crop = screen_frame[cfg.y:cfg.y + cfg.h, cfg.x:cfg.x + cfg.w]
+                props = proposal_engine.generate_proposals_for_region(
+                    crop, Rect(cfg.x, cfg.y, cfg.w, cfg.h), target_img, r_id
+                )
+                if props:
+                    proposals_by_region[r_id] = props
 
-        t_end = time.perf_counter()
-        total_latency_ms = (t_end - t_start) * 1000.0
+            candidates, diag = proposal_engine.apply_same_frame_escalation(proposals_by_region)
+            t_prop_total += (time.perf_counter() - t0) * 1000.0
+
+            if not candidates:
+                continue
+
+            # Stage C: Tri-Condition Verification (Geometry + ONNX Batch)
+            t0 = time.perf_counter()
+            decisions = vision_engine.evaluate_candidates(screen_frame, candidates, target, target_img)
+            t_veri_total += (time.perf_counter() - t0) * 1000.0
+
+            # Stage D: Fresh Verification & Action Dispatch
+            for res in decisions:
+                if res.decision.value == "MATCH":
+                    owner_region = ledger.associate_candidate(
+                        res.candidate_rect[0], res.candidate_rect[1], target.target_id, candidate_region_id=active_rid
+                    )
+                    if owner_region:
+                        # Fresh verify simulation on sub-ROI
+                        t0_fv = time.perf_counter()
+                        rx, ry, rw, rh = res.candidate_rect
+                        fresh_crop = screen_frame[ry:ry+rh, rx:rx+rw]
+                        g_fresh = geo_verifier.compute_geometry_score(fresh_crop, target_img)
+                        assert g_fresh >= calib.t_g, f"Fresh verify failed in benchmark: {g_fresh:.3f} < {calib.t_g}"
+                        t_fv_total = (time.perf_counter() - t0_fv) * 1000.0
+
+                        # Action dispatch
+                        t0_disp = time.perf_counter()
+                        dispatched = action_manager.dispatch_action(rx, ry, {"region_id": owner_region})
+                        assert dispatched, "Action dispatch must succeed in benchmark"
+                        ledger.advance_region(owner_region)
+                        t_disp_total = (time.perf_counter() - t0_disp) * 1000.0
+                        dispatch_success = True
+                        successful_dispatches += 1
+                        break
+
+            if dispatch_success:
+                break
+
+        action_dispatched_time = time.perf_counter()
+        total_latency_ms = (action_dispatched_time - first_visible_time) * 1000.0
 
         latencies.append(total_latency_ms)
         stage_breakdowns.append({
-            "scheduling": t_sched,
-            "proposal": t_proposal,
-            "verification": t_verify,
-            "dispatch": t_dispatch
+            "scheduling": t_sched_total,
+            "proposal": t_prop_total,
+            "verification": t_veri_total,
+            "fresh_verify": t_fv_total,
+            "dispatch": t_disp_total
         })
+
+    assert successful_dispatches == expected_dispatches, (
+        f"Mismatch: {successful_dispatches}/{expected_dispatches} targets dispatched"
+    )
 
     # 5. Evaluate Report
     report = BenchmarkRunner.evaluate_latency_samples(

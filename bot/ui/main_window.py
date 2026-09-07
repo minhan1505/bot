@@ -44,6 +44,7 @@ from bot.vision.proposal import CandidateProposalEngine
 from bot.vision.engine import VisionEngine
 from bot.workflow.ledger import SessionLedger
 from bot.workflow.runner import BotRuntimeRunner
+from bot.telemetry.logger import AsyncTelemetryLogger
 
 MODEL_PATH = os.path.abspath("models/ui_vision_encoder.onnx")
 
@@ -117,6 +118,7 @@ class MainWindow(QMainWindow):
         self.db = Database(db_path)
         self.capture_manager = CaptureManager(monitor_index=1, prefer_dxgi=True)
         self.action_manager = ActionManager()
+        self.telemetry_logger = AsyncTelemetryLogger(log_filepath="logs/telemetry.jsonl")
 
         # Vision Subsystem
         self.geo_verifier = GeometryVerifier(canonical_size=(64, 64))
@@ -263,8 +265,8 @@ class MainWindow(QMainWindow):
         info = QLabel("Configure independent Regions/Tables (supports 1..N arbitrary layout).")
         layout.addWidget(info)
 
-        self.table_regions = QTableWidget(0, 5)
-        self.table_regions.setHorizontalHeaderLabels(["Region ID", "Name", "X", "Y", "Dimensions (WxH)"])
+        self.table_regions = QTableWidget(0, 6)
+        self.table_regions.setHorizontalHeaderLabels(["Region ID", "Name", "X", "Y", "Dimensions (WxH)", "Assigned Workflow"])
         self.table_regions.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         layout.addWidget(self.table_regions)
 
@@ -312,6 +314,7 @@ class MainWindow(QMainWindow):
             return
         prof_id = self.combo_profiles.currentData()
         if prof_id:
+            self.vision_engine.clear_target_cache()
             self.active_profile = self.db.load_profile(prof_id)
             self._refresh_profile_views()
             self.tray_manager.update_status(
@@ -333,8 +336,9 @@ class MainWindow(QMainWindow):
             self.table_targets.setItem(row, 2, QTableWidgetItem(str(len(target.reference_image_paths))))
             self.table_targets.setItem(row, 3, QTableWidgetItem("Active" if target.enabled else "Disabled"))
 
-        # Refresh region table
+        # Refresh region table with workflow binding
         self.table_regions.setRowCount(0)
+        available_wfs = list(self.active_profile.workflows.keys()) if self.active_profile.workflows else ["default_workflow"]
         for r_id, reg in self.active_profile.regions.items():
             row = self.table_regions.rowCount()
             self.table_regions.insertRow(row)
@@ -343,6 +347,20 @@ class MainWindow(QMainWindow):
             self.table_regions.setItem(row, 2, QTableWidgetItem(str(reg.x)))
             self.table_regions.setItem(row, 3, QTableWidgetItem(str(reg.y)))
             self.table_regions.setItem(row, 4, QTableWidgetItem(f"{reg.w}x{reg.h}"))
+
+            combo_wf = QComboBox()
+            for wf_id in available_wfs:
+                combo_wf.addItem(wf_id, wf_id)
+            if reg.workflow_id and reg.workflow_id in available_wfs:
+                combo_wf.setCurrentText(reg.workflow_id)
+            combo_wf.currentTextChanged.connect(lambda text, r=reg.region_id: self._on_region_workflow_changed(r, text))
+            self.table_regions.setCellWidget(row, 5, combo_wf)
+
+    def _on_region_workflow_changed(self, region_id: str, workflow_id: str):
+        if self.active_profile and region_id in self.active_profile.regions:
+            self.active_profile.regions[region_id].workflow_id = workflow_id
+            self.db.save_profile(self.active_profile)
+            logger.info(f"Region '{region_id}' bound to workflow '{workflow_id}'")
 
     def _probe_action_backend(self):
         """Runs capability probe for background action."""
@@ -405,6 +423,15 @@ class MainWindow(QMainWindow):
         self.overlay.show()
 
     def _on_target_cropped(self, crop: np.ndarray):
+        is_separable, reason = check_geometry_separability(crop)
+        if not is_separable:
+            QMessageBox.warning(
+                self,
+                "TARGET_NOT_GEOMETRICALLY_SEPARABLE",
+                f"Cropped region rejected:\n{reason}\nTarget must have distinct contour/edge structure."
+            )
+            return
+
         os.makedirs("data/targets", exist_ok=True)
         t_id = f"target_{len(self.active_profile.targets) + 1}"
         save_path = os.path.abspath(f"data/targets/{t_id}.png")
@@ -536,17 +563,22 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "No Regions", "Configure at least 1 region before starting bot.")
                 return
 
-            # Register regions and default workflow in SessionLedger
+            # Register regions with their designated workflows
             self.ledger = SessionLedger()
-            wf = self.active_profile.workflows.get("default_workflow")
-            if not wf:
-                wf = Workflow(workflow_id="default_wf", name="Default")
+            default_wf = self.active_profile.workflows.get("default_workflow")
+            if not default_wf:
+                default_wf = Workflow(workflow_id="default_wf", name="Default")
                 if self.active_profile.targets:
                     t_id = list(self.active_profile.targets.keys())[0]
-                    wf.steps.append(WorkflowStep(step_index=0, target_id=t_id))
+                    default_wf.steps.append(WorkflowStep(step_index=0, target_id=t_id))
 
             for r_id, reg in self.active_profile.regions.items():
-                inst = self.ledger.register_region(reg, wf)
+                wf_to_use = None
+                if reg.workflow_id and reg.workflow_id in self.active_profile.workflows:
+                    wf_to_use = self.active_profile.workflows[reg.workflow_id]
+                else:
+                    wf_to_use = default_wf
+                inst = self.ledger.register_region(reg, wf_to_use)
                 inst.start_workflow()
 
             # Start Runner Thread
@@ -557,7 +589,9 @@ class MainWindow(QMainWindow):
                 vision_engine=self.vision_engine,
                 action_manager=self.action_manager,
                 ledger=self.ledger,
+                telemetry_logger=getattr(self, "telemetry_logger", None),
                 is_dry_run=is_dry_run,
+                is_production="Production" in mode,
                 on_decision_callback=self.decision_received_signal.emit,
                 on_state_callback=self.region_state_signal.emit
             )
@@ -606,12 +640,20 @@ class MainWindow(QMainWindow):
 
     @Slot(str, str, int)
     def _on_live_region_state(self, region_id: str, state_str: str, step_idx: int):
-        pass
+        for row in range(self.table_regions.rowCount()):
+            item = self.table_regions.item(row, 0)
+            if item and item.text() == region_id:
+                name_item = self.table_regions.item(row, 1)
+                if name_item:
+                    name_item.setToolTip(f"Live State: {state_str} (Step {step_idx + 1})")
+                break
 
     def closeEvent(self, event):
         """Ensures background threads and hooks are cleanly stopped on window exit."""
         if self.runner and self.runner.is_running:
             self.runner.stop()
+        if self.telemetry_logger:
+            self.telemetry_logger.close()
         self.hotkey_manager.stop()
         self.capture_manager.close()
         event.accept()

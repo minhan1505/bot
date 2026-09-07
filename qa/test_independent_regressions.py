@@ -86,10 +86,12 @@ def test_overlap_cannot_steal_explicit_candidate_region():
     for region_id, x in [("A", 0), ("B", 50)]:
         ledger.register_region(RegionModel(region_id=region_id, name=region_id,
             x=x, y=0, w=100, h=100), wf).start_workflow()
-    # Runner has a decision tagged B, but drops that identity at association.
+    # Explicit identity passed per contract:
     candidate_region_id = "B"
-    owner = ledger.associate_candidate(75, 50, "t")
+    owner = ledger.associate_candidate(75, 50, "t", candidate_region_id=candidate_region_id)
     assert owner == candidate_region_id, f"Candidate B reassigned to {owner}"
+    # When identity is omitted during an overlap, contract requires fail-closed rejection:
+    assert ledger.associate_candidate(75, 50, "t") is None
 
 
 def test_preprocessing_change_invalidates_calibration():

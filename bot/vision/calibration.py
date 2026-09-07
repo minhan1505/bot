@@ -70,6 +70,23 @@ class CalibrationEngine:
         if not d_val:
             raise ValueError(f"Validation set d_val cannot be empty for target {target_id}")
 
+        # Enforce disjoint session split between d_calib and d_val
+        calib_sessions = {s.session_id for s in d_calib if s.session_id}
+        val_sessions = {s.session_id for s in d_val if s.session_id}
+        if calib_sessions and val_sessions and not calib_sessions.isdisjoint(val_sessions):
+            overlap_sessions = calib_sessions.intersection(val_sessions)
+            raise CalibrationOverlapError(
+                f"DATA_LEAKAGE_DETECTED: Sessions {overlap_sessions} are present in both D_calib and D_val. "
+                f"Calibration and validation sets must originate from distinct capture sessions."
+            )
+
+        # Enforce non-empty competitor set for Identity Margin gate
+        if not alternative_identity_imgs:
+            raise CalibrationOverlapError(
+                f"CALIBRATION_BLOCKED_MISSING_CONFUSERS: Target '{target_id}' has no competitor targets or confusers configured. "
+                f"Identity Margin gate requires at least one competitor/confuser to establish M_safe."
+            )
+
         # Ensure target embedding is cached
         self.onnx_verifier.cache_target_embedding(target_id, [target_reference_img])
         target_emb = self.onnx_verifier.get_cached_target_embedding(target_id)
@@ -119,6 +136,7 @@ class CalibrationEngine:
         min_m_pos = min(calib_m_pos)
         max_m_neg = max(calib_m_neg)
 
+
         # -------------------------------------------------------------
         # STEP 2: Pre-Threshold Overlap Rejection (Pre-Overlap Gate)
         # -------------------------------------------------------------
@@ -133,6 +151,13 @@ class CalibrationEngine:
             raise CalibrationOverlapError(
                 f"CONFIGURATION_REJECTED: INSUFFICIENT_EMBEDDING_SEPARATION on D_calib. "
                 f"min_positive ({min_e_pos:.4f}) <= max_negative ({max_e_neg:.4f})."
+            )
+
+        if min_m_pos <= max_m_neg:
+            raise CalibrationOverlapError(
+                f"CONFIGURATION_REJECTED: INSUFFICIENT_IDENTITY_MARGIN on D_calib. "
+                f"min_positive_margin ({min_m_pos:.4f}) <= max_negative_margin ({max_m_neg:.4f}). "
+                f"Target requires distinct margin against competitors."
             )
 
         # Calculate data-driven midpoint thresholds on D_calib

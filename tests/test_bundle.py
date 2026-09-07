@@ -54,3 +54,14 @@ def test_zip_slip_path_traversal_attack_rejected(tmp_path):
     imported_prof, msg = ProfileBundleManager.safe_import_profile_from_zip(malicious_zip)
     assert imported_prof is None
     assert "SECURITY_ERROR" in msg
+
+
+def test_invalid_profile_id_rejected(tmp_path):
+    # Construct zip with profile_id containing illegal characters (e.g. A/B or path traversal)
+    bad_zip = str(tmp_path / "bad_id.zip")
+    with zipfile.ZipFile(bad_zip, "w") as zf:
+        zf.writestr("profile.json", '{"profile_id": "../evil/prof", "name": "Evil", "created_at": 1000}')
+
+    imported_prof, msg = ProfileBundleManager.safe_import_profile_from_zip(bad_zip)
+    assert imported_prof is None
+    assert "SECURITY_ERROR" in msg

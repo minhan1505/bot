@@ -89,29 +89,40 @@ class WindowActionBackend(BaseActionBackend):
 
         # Convert screen to client coordinates
         pt = wintypes.POINT(x=screen_x, y=screen_y)
-        user32.ScreenToClient(wintypes.HWND(target_hwnd), ctypes.byref(pt))
+        res_stc = user32.ScreenToClient(wintypes.HWND(target_hwnd), ctypes.byref(pt))
+        if res_stc == 0:
+            logger.error(f"ScreenToClient failed for HWND {target_hwnd}")
+            return False
         client_x, client_y = pt.x, pt.y
 
         # Pack into lParam: low-order word = x, high-order word = y
         l_param = (client_y << 16) | (client_x & 0xFFFF)
 
         # 1. Post WM_LBUTTONDOWN
-        user32.PostMessageW(
+        res_down = user32.PostMessageW(
             wintypes.HWND(target_hwnd),
             wintypes.UINT(WM_LBUTTONDOWN),
             wintypes.WPARAM(MK_LBUTTON),
             wintypes.LPARAM(l_param)
         )
+        if res_down == 0:
+            logger.error(f"PostMessageW WM_LBUTTONDOWN failed for HWND {target_hwnd}")
+            return False
 
         time.sleep(0.030) # 30ms click duration
 
         # 2. Post WM_LBUTTONUP
-        user32.PostMessageW(
+        res_up = user32.PostMessageW(
             wintypes.HWND(target_hwnd),
             wintypes.UINT(WM_LBUTTONUP),
             wintypes.WPARAM(0),
             wintypes.LPARAM(l_param)
         )
+        if res_up == 0:
+            logger.error(f"PostMessageW WM_LBUTTONUP failed for HWND {target_hwnd} after DOWN sent!")
+            # 1 recovery attempt
+            user32.PostMessageW(wintypes.HWND(target_hwnd), wintypes.UINT(WM_LBUTTONUP), wintypes.WPARAM(0), wintypes.LPARAM(l_param))
+            return False
 
         logger.info(f"Win32 background click posted to HWND {target_hwnd} at client ({client_x}, {client_y})")
         return True

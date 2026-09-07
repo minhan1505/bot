@@ -85,6 +85,18 @@ class RegionModel(BaseModel):
     w: int
     h: int
     enabled: bool = True
+    workflow_id: Optional[str] = None
+
+
+class SafetyConfig(BaseModel):
+    """
+    Canonical anti-runaway and quota safety bounds.
+    """
+    max_clicks_per_second: float = 10.0
+    circuit_breaker_threshold: int = 30
+    circuit_breaker_window_sec: float = 5.0
+    max_clicks_per_region: int = 100
+    max_total_clicks: int = 1000
 
 
 class WorkflowStep(BaseModel):
@@ -119,6 +131,7 @@ class Profile(BaseModel):
     regions: Dict[str, RegionModel] = Field(default_factory=dict)
     targets: Dict[str, Target] = Field(default_factory=dict)
     workflows: Dict[str, Workflow] = Field(default_factory=dict)
+    safety_config: SafetyConfig = Field(default_factory=SafetyConfig)
     scan_interval_ms: int = 16 # ~60 FPS
     created_at: float = Field(default_factory=time.time)
 
@@ -130,6 +143,8 @@ class DecisionResult(BaseModel):
     """
     target_id: Optional[str] = None
     region_id: Optional[str] = None
+    workflow_id: Optional[str] = None
+    generation: int = 0
     candidate_rect: Tuple[int, int, int, int] # (x, y, w, h)
     geometry_score: float
     geometry_pass: bool
@@ -139,4 +154,7 @@ class DecisionResult(BaseModel):
     margin_pass: bool
     decision: DecisionClass
     reason: str
+    capture_timestamp: float = 0.0
+    dispatch_timestamp: float = 0.0
+    latency_ms: float = 0.0
     timestamp: float = Field(default_factory=time.time)

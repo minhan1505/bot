@@ -12,6 +12,7 @@ Enforces:
 import time
 from typing import Optional, Dict, Any, Tuple
 import logging
+from bot.core.models import SafetyConfig
 from bot.action.base import BaseActionBackend
 from bot.action.cdp_backend import CDPActionBackend
 from bot.action.window_backend import WindowActionBackend
@@ -27,20 +28,32 @@ class ActionManager:
     def __init__(
         self,
         backend: Optional[BaseActionBackend] = None,
-        max_clicks_per_second: float = 4.0,
-        circuit_breaker_threshold: int = 20
+        safety_config: Optional[SafetyConfig] = None,
+        max_clicks_per_second: float = 10.0,
+        circuit_breaker_threshold: int = 30
     ):
         self.backend = backend
-        self.max_clicks_per_sec = max_clicks_per_second
-        self.circuit_breaker_threshold = circuit_breaker_threshold
+        if safety_config is not None:
+            self.safety_config = safety_config
+        else:
+            self.safety_config = SafetyConfig(
+                max_clicks_per_second=max_clicks_per_second,
+                circuit_breaker_threshold=circuit_breaker_threshold
+            )
+
+        self.max_clicks_per_sec = self.safety_config.max_clicks_per_second
+        self.circuit_breaker_threshold = self.safety_config.circuit_breaker_threshold
 
         self.is_supported = False
+        self.is_protocol_verified = False
+        self.is_surface_verified = False
         self.support_status_message = "NOT_PROBED"
         self.emergency_stop_triggered = False
 
         # Anti-runaway tracking
         self._recent_click_timestamps = []
         self._total_clicks = 0
+        self._region_clicks: Dict[str, int] = {}
         self._circuit_breaker_tripped = False
 
     def probe_and_bind(self, backend: BaseActionBackend, context: Dict[str, Any]) -> Tuple[bool, str]:
@@ -51,6 +64,8 @@ class ActionManager:
         self.backend = backend
         supported, reason = self.backend.probe_capability(context)
         self.is_supported = supported
+        self.is_protocol_verified = supported
+        self.is_surface_verified = context.get("surface_verified", False)
         self.support_status_message = reason
 
         if not supported:
@@ -91,24 +106,47 @@ class ActionManager:
             logger.error("Action dispatch rejected: BACKGROUND_ACTION_UNSUPPORTED. Physical mouse fallback is forbidden.")
             return False
 
+        # If production mode requested, require surface verification
+        if context.get("is_production", False) and not self.is_surface_verified:
+            logger.error("Action dispatch rejected: SURFACE_UNVERIFIED_ACTION_BLOCKED. Protocol ACK is not surface verification.")
+            return False
+
+        # Total click quota check
+        if self._total_clicks >= self.safety_config.max_total_clicks:
+            logger.critical(f"Total click quota exceeded ({self._total_clicks} >= {self.safety_config.max_total_clicks}). Halting.")
+            self._circuit_breaker_tripped = True
+            return False
+
+        # Per-region click quota check
+        region_id = context.get("region_id")
+        if region_id:
+            reg_clicks = self._region_clicks.get(region_id, 0)
+            if reg_clicks >= self.safety_config.max_clicks_per_region:
+                logger.warning(f"Region '{region_id}' click quota exceeded ({reg_clicks} >= {self.safety_config.max_clicks_per_region}). Dropping action.")
+                return False
+
         now = time.time()
 
-        # Anti-runaway rate limiting
-        # Prune clicks older than 1 second
-        self._recent_click_timestamps = [t for t in self._recent_click_timestamps if now - t < 1.0]
-
-        if len(self._recent_click_timestamps) >= self.max_clicks_per_sec:
-            logger.warning(f"Anti-Runaway triggered: Rate limit exceeded ({len(self._recent_click_timestamps)} >= {self.max_clicks_per_sec}/sec). Dropping action.")
+        # Anti-runaway rate limiting: 1-second window
+        clicks_1s = [t for t in self._recent_click_timestamps if now - t < 1.0]
+        if len(clicks_1s) >= self.max_clicks_per_sec:
+            logger.warning(f"Anti-Runaway triggered: Rate limit exceeded ({len(clicks_1s)} >= {self.max_clicks_per_sec}/sec). Dropping action.")
             return False
+
+        # Prune circuit breaker window
+        cb_window = self.safety_config.circuit_breaker_window_sec
+        self._recent_click_timestamps = [t for t in self._recent_click_timestamps if now - t < cb_window]
 
         # Dispatch through verified non-physical backend
         success = self.backend.dispatch_click(screen_x, screen_y, context)
         if success:
             self._recent_click_timestamps.append(now)
             self._total_clicks += 1
+            if region_id:
+                self._region_clicks[region_id] = self._region_clicks.get(region_id, 0) + 1
             if len(self._recent_click_timestamps) >= self.circuit_breaker_threshold:
                 self._circuit_breaker_tripped = True
-                logger.critical(f"ANTI-RUNAWAY CIRCUIT BREAKER TRIPPED! ({len(self._recent_click_timestamps)} actions in 1 sec). Bot halted.")
+                logger.critical(f"ANTI-RUNAWAY CIRCUIT BREAKER TRIPPED! ({len(self._recent_click_timestamps)} actions in {cb_window} sec). Bot halted.")
 
         return success
 
