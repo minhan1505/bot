@@ -1,8 +1,15 @@
 """
 scripts/export_models.py
 ~~~~~~~~~~~~~~~~~~~~~~~~
-Generates and exports the self-contained UI Vision Encoder model to ONNX.
+Generates and exports the deterministic UI Vision Encoder baseline model to ONNX.
 Computes and verifies SHA-256 model checksum.
+
+NOTE: This baseline model uses analytical spatial filter banks (directional edge kernels,
+contour integrators, and structural filters) exported via ONNX Conv/ReLU/MaxPool/Flatten.
+It serves as a deterministic baseline and does NOT require external PyTorch checkpoint weights.
+Production pre-trained deep models with empirical held-out benchmark datasets (D_test)
+remain marked PARTIAL in AUDIT_CHECKLIST.md until trained weights and real held-out UI datasets
+are provided.
 """
 
 import os
@@ -21,12 +28,12 @@ def build_and_export_encoder(output_path: str = MODEL_PATH):
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
     # Input: [batch, 3, 64, 64]
-    # Architecture: 3-stage Conv-ReLU-MaxPool + GlobalAveragePool -> 128-D embedding
+    # Architecture: 3-stage Conv-ReLU-MaxPool + Flatten -> 128-D spatial feature embedding
     X = helper.make_tensor_value_info('input', TensorProto.FLOAT, ['batch', 3, 64, 64])
     Y = helper.make_tensor_value_info('embedding', TensorProto.FLOAT, ['batch', 128])
 
-    # Deterministic structured mathematical filter bank (Zero random noise)
-    # Stage 1: 16 Spatial Directional & Edge Filters (Sobel derivatives + Gabor wavelets)
+    # Deterministic spatial filter bank (Sobel directional & contour structural filters)
+    # Stage 1: 16 Spatial Directional & Edge Filters
     w1 = np.zeros((16, 3, 3, 3), dtype=np.float32)
     for idx in range(8):
         theta = idx * np.pi / 4.0

@@ -215,3 +215,130 @@ def test_main_window_production_guard_rejects_unverified_surface():
             runner_class.assert_not_called()
             mock_msg.assert_called_once()
             assert "surface compatibility has not been verified" in mock_msg.call_args[0][2]
+
+
+def test_main_window_production_guard_rejects_unassigned_workflow_for_region():
+    """Verifies that Production mode blocks execution if any region has no assigned workflow."""
+    calib = CalibrationProfile(model_sha256="test", precision="FP32", t_g=0.6, t_e=0.7, m_safe=0.05)
+    profile = Profile(
+        profile_id="p_prod",
+        name="Prod Profile",
+        targets={"t1": Target(target_id="t1", name="Calibrated Target", calibration=calib)},
+        regions={"r1": RegionModel(region_id="r1", name="R1", workflow_id="", x=0, y=0, w=100, h=100)},
+        workflows={"wf1": Workflow(workflow_id="wf1", name="WF1", steps=[WorkflowStep(step_index=0, target_id="t1")])}
+    )
+
+    action_mgr = MagicMock(is_supported=True, is_surface_verified=True)
+    ui = SimpleNamespace(
+        runner=None,
+        combo_mode=MagicMock(),
+        action_manager=action_mgr,
+        active_profile=profile,
+        capture_manager=MagicMock(),
+        vision_engine=MagicMock(),
+        decision_received_signal=MagicMock(),
+        region_state_signal=MagicMock(),
+        btn_start=MagicMock(),
+        tray_manager=MagicMock()
+    )
+    ui.combo_mode.currentText.return_value = "Production Background Action"
+
+    with patch("PySide6.QtWidgets.QMessageBox.critical") as mock_msg:
+        with patch("bot.ui.main_window.BotRuntimeRunner") as runner_class:
+            MainWindow._toggle_bot(ui)
+            runner_class.assert_not_called()
+            mock_msg.assert_called_once()
+            assert "has no assigned workflow" in mock_msg.call_args[0][2]
+
+
+def test_main_window_production_guard_rejects_empty_workflow_steps():
+    """Verifies that Production mode blocks execution if assigned workflow has 0 steps."""
+    calib = CalibrationProfile(model_sha256="test", precision="FP32", t_g=0.6, t_e=0.7, m_safe=0.05)
+    profile = Profile(
+        profile_id="p_prod",
+        name="Prod Profile",
+        targets={"t1": Target(target_id="t1", name="Calibrated Target", calibration=calib)},
+        regions={"r1": RegionModel(region_id="r1", name="R1", workflow_id="wf_empty", x=0, y=0, w=100, h=100)},
+        workflows={"wf_empty": Workflow(workflow_id="wf_empty", name="Empty WF", steps=[])}
+    )
+
+    action_mgr = MagicMock(is_supported=True, is_surface_verified=True)
+    ui = SimpleNamespace(
+        runner=None,
+        combo_mode=MagicMock(),
+        action_manager=action_mgr,
+        active_profile=profile,
+        capture_manager=MagicMock(),
+        vision_engine=MagicMock(),
+        decision_received_signal=MagicMock(),
+        region_state_signal=MagicMock(),
+        btn_start=MagicMock(),
+        tray_manager=MagicMock()
+    )
+    ui.combo_mode.currentText.return_value = "Production Background Action"
+
+    with patch("PySide6.QtWidgets.QMessageBox.critical") as mock_msg:
+        with patch("bot.ui.main_window.BotRuntimeRunner") as runner_class:
+            MainWindow._toggle_bot(ui)
+            runner_class.assert_not_called()
+            mock_msg.assert_called_once()
+            assert "has 0 steps" in mock_msg.call_args[0][2]
+
+
+def test_target_calibration_dialog_requires_dual_session_real_samples():
+    """Verifies TargetCalibrationDialog blocks calibration if Session A or B lacks real samples."""
+    from bot.ui.calibration_dialog import TargetCalibrationDialog
+
+    target = Target(target_id="t_cal", name="Calib Target")
+    profile = Profile(profile_id="p_test", name="P")
+    onnx_v = MagicMock()
+    geo_v = MagicMock()
+
+    dlg = TargetCalibrationDialog(target, profile, onnx_v, geo_v)
+    assert len(dlg.session_a_pos) == 0
+    assert len(dlg.session_b_pos) == 0
+
+    # Try calibrating with 0 samples
+    with patch("PySide6.QtWidgets.QMessageBox.warning") as mock_warn:
+        dlg._run_calibration()
+        mock_warn.assert_called_once()
+        assert "independent capture sessions" in mock_warn.call_args[0][2]
+
+    # Add sample only to Session A
+    dlg.session_a_pos.append("fake/path/a.png")
+    with patch("PySide6.QtWidgets.QMessageBox.warning") as mock_warn:
+        dlg._run_calibration()
+        mock_warn.assert_called_once()
+        assert "independent capture sessions" in mock_warn.call_args[0][2]
+
+
+def test_cdp_backend_viewport_context_binding_and_production_guard():
+    """Verifies CDPActionBackend rejects clicks in Production mode when ViewportContext is missing."""
+    from bot.action.cdp_backend import CDPActionBackend
+    import io
+    import json
+
+    backend = CDPActionBackend()
+
+    # Test get_available_pages
+    fake_json = json.dumps([
+        {"id": "tab1", "type": "page", "title": "Game Window", "url": "https://game.com", "webSocketDebuggerUrl": "ws://127.0.0.1:9222/tab1"},
+        {"id": "bg1", "type": "background_page", "title": "Ext", "url": "chrome-ext://1"}
+    ]).encode("utf-8")
+
+    with patch("urllib.request.urlopen") as mock_url:
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = fake_json
+        mock_resp.__enter__.return_value = mock_resp
+        mock_url.return_value = mock_resp
+
+        pages = backend.get_available_pages()
+        assert len(pages) == 1
+        assert pages[0]["id"] == "tab1"
+        assert pages[0]["title"] == "Game Window"
+
+    # Test production fail-closed when viewport_context is None
+    res = backend.dispatch_click(100, 100, context={"is_production": True})
+    assert res.status == ActionDispatchStatus.NOT_SENT
+    assert "ViewportContext" in res.reason
+

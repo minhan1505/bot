@@ -171,11 +171,10 @@ Output includes the comprehensive markdown benchmark report verifying 0 samples 
 | **F02** | P1 | Introspection caller variable dependency | `bot/workflow/ledger.py`: Completely purged `inspect.currentframe()`. Explicit parameter passing only; rejects ambiguity on overlap. Verified in `qa/test_pr1_followup.py` (Test 4). | **RESOLVED** |
 | **F03** | P1 | Unbounded retries resetting step deadline | `bot/workflow/state_machine.py`: Monotonic absolute deadline `step_deadline` decoupled from sub-state transitions. Strictly limits attempts to $1 + \text{retry\_limit}$. Verified in `qa/test_ae5036a_acceptance.py`. | **RESOLVED** |
 | **F04** | P1 | Coordinate system & capture desktop offset | `bot/workflow/runner.py`: Adds `desktop_offset` to candidate coordinates. `bot/core/coordinates.py`: ViewportContext provides computed `inner_width`/`inner_height`. Verified in `qa/test_ae5036a_acceptance.py`. | **RESOLVED** |
-| **F05** | P1 | Protocol error & Win32 return checks | `bot/action/cdp_backend.py` validates matching message IDs and `error` field. `bot/action/window_backend.py` checks return values of `ScreenToClient` and `PostMessageW`. | **RESOLVED** |
-| **F06** | P1 | Fixed UI calibration thresholds | `bot/vision/calibration.py`: `calibrate_target_from_samples(...)` orchestrator managing partitioned $D_{calib}$/$D_{val}$ with zero data leakage. `bot/ui/calibration_dialog.py`: Interactive GUI wizard for empirical calibration. Purged hardcoded `.55/.65/.05` constants; uncalibrated targets blocked in Production mode. Verified in `tests/test_calibration_and_engine.py` & `tests/test_ui_workflow_and_dialogs.py`. | **RESOLVED** |
-| **F07** | P1 | Vision encoder empirical separability | `scripts/export_models.py`: Exported deterministic 3-stage spatial filter bank (directional Sobel derivatives, Gabor wavelets, spatial quadrant pooling, orthonormal 128-D projection). Checksum verified in `models/ui_vision_encoder.sha256`. Empirical validation suite demonstrates zero false positive overlap and separation gap $+0.044$ to $+0.338$. Verified in `tests/test_model_empirical_validation.py`. | **RESOLVED** |
-| **F08** | P1 | SLA benchmark validity | `bot/telemetry/hardware_sla_harness.py`: End-to-end `HardwareSLAAcceptanceHarness` executing live `BotRuntimeRunner` thread across 19 concurrent active regions under Two-Tier Scheduling with production safety bounds. Verified in `tests/test_hardware_sla_harness.py` (mean $\approx 62.0\text{ ms}$, max $\approx 102.8\text{ ms} \le 700.0\text{ ms}$, 0 violations). Physical multi-monitor live rig certification reserved for on-site deployment. | **PARTIAL / HARNESS COMPLETED (STAGING RIG REQUIRED)** |
-| **F09** | P1 | UI workflow & region binding | `bot/ui/step_dialog.py`: `WorkflowStepDialog` for target selection and step parameter configuration. `bot/ui/main_window.py`: Full dynamic step reordering (Move Up, Move Down, Delete). Visual screen ROI selection via `ScreenCropOverlay(mode="region")`. Interactive 2-stage surface probe via `SurfaceVerificationDialog` with fail-closed Production mode guard. Verified in `tests/test_ui_workflow_and_dialogs.py`. | **RESOLVED** |
+| **F06** | P1 | Fixed UI calibration thresholds & dual-session wizard | `bot/vision/calibration.py`: `calibrate_target_from_samples(...)` orchestrator enforcing genuine partitioned $D_{calib}$ (Session A) and $D_{val}$ (Session B) real sample captures with zero data leakage and zero synthetic brightness shifting. `bot/ui/calibration_dialog.py`: Interactive GUI wizard enforcing dual-session real captures. Hardened `_toggle_bot`: uncalibrated targets blocked in Production mode. Verified in `tests/test_calibration_and_engine.py` & `tests/test_ui_workflow_and_dialogs.py`. | **RESOLVED** |
+| **F07** | P1 | Vision encoder empirical separability | `scripts/export_models.py`: Exported deterministic 3-stage spatial filter bank baseline (directional Sobel derivatives, contour integrators, structural filters via Conv/ReLU/MaxPool/Flatten) to ONNX with SHA-256 in `models/ui_vision_encoder.sha256`. No external pretrained checkpoint loaded; no learned Gemm projection. Validated on synthetic glyphs. Real held-out UI target dataset ($D_{test}$) and trained checkpoint pending. | **PARTIAL / DETERMINISTIC BASELINE (PENDING PRETRAINED CHECKPOINT & REAL D_TEST)** |
+| **F08** | P1 | SLA benchmark validity | `bot/telemetry/hardware_sla_harness.py`: End-to-end `HardwareSLAAcceptanceHarness` executing live `BotRuntimeRunner` thread across 19 concurrent active regions under Two-Tier Scheduling with production safety bounds. Verified in `tests/test_hardware_sla_harness.py` (mean $\approx 62.0\text{ ms}$, max $\approx 102.8\text{ ms} \le 700.0\text{ ms}$, 0 violations). Physical multi-monitor live rig certification reserved for on-site deployment without fabricating physical hardware evidence. | **PARTIAL / HARNESS COMPLETED (STAGING RIG REQUIRED)** |
+| **F09** | P1 | UI workflow & region binding | `bot/ui/step_dialog.py`: `WorkflowStepDialog` for explicit target selection and parameters. Step reordering in `MainWindow`. Visual screen ROI overlay. `SurfaceVerificationDialog` with tab selection and Stage 2 active benign `mouseMoved` DOM event probe. `CDPActionBackend` & `ActionManager` bind `viewport_context` and fail-closed in Production if missing. `_toggle_bot` strictly enforces explicit workflow with $\ge 1$ steps for all regions (no default guessing). Verified in `tests/test_ui_workflow_and_dialogs.py`. | **RESOLVED** |
 | **F10** | P1 | Fresh verify Tri-Gate authority & retry | `bot/workflow/runner.py`: Tri-gate check with deadline expiry and generation snapshot guards. Fails transition cleanly without sticking. Verified in `qa/test_ae5036a_acceptance.py`. | **RESOLVED** |
 | **F11** | P2 | Telemetry audit integration | `bot/telemetry/logger.py`: Atomic critical slot reservation, ordinary producer encroachment guard, and token consume methods. Verified in `qa/test_ae5036a_acceptance.py`. | **RESOLVED** |
 | **F12** | P2 | Profile template cache invalidation | `bot/vision/onnx_verifier.py` & `bot/vision/engine.py`: Target cache keys incorporate reference image SHA-256 hash. Profile switches call `clear_target_cache()`. Verified in `tests/test_action_and_safety.py`. | **RESOLVED** |
@@ -353,59 +352,65 @@ Output includes the comprehensive markdown benchmark report verifying 0 samples 
 ## 12. Resolution of Remaining Partial Findings (F06, F07, F08, F09)
 
 ### F06 — Target Calibration Production Flow & UI Wizard
-- **Problem:** Target creation previously assigned arbitrary fallback thresholds (`.55/.65/.05`), and runner fell back to heuristic defaults if calibration was missing.
+- **Problem:** Target creation previously assigned arbitrary fallback thresholds (`.55/.65/.05`), and runner fell back to heuristic defaults if calibration was missing. Furthermore, an earlier wizard iteration synthetically modified brightness on a single reference image to fake Session A / Session B partitions.
 - **Resolution:**
-  - Implemented `calibrate_target_from_samples(...)` in `bot/vision/calibration.py`, strictly enforcing 60/40 partitioned calibration ($D_{calib}$) and validation ($D_{val}$) sets with zero data leakage.
+  - Fixed `TargetCalibrationDialog` constructor signature mismatch: unified to `(target, profile, onnx_verifier, geo_verifier, parent=None)`.
+  - Completely purged synthetic brightness shifting (`*0.9 / *1.1`) and fake session IDs.
+  - Implemented genuine two-session real sample acquisition: Session A ($D_{calib}$) and Session B ($D_{val}$) require independent real screen captures before calibration can proceed.
   - Mathematical pre-overlap rejection: computes target-to-confuser cross-similarity $S_{neg}$ and target self-consistency $S_{pos}$. Asserts separation gap $\delta = \min(S_{pos}) - \max(S_{neg}) > 0$.
   - Threshold selection bounds: $T_e = \min(S_{pos}) - 0.5 \cdot \delta$, $T_g = \min(G_{pos}) - 0.5 \cdot \delta_g$, $M_{safe} = 0.5 \cdot \delta$.
-  - Developed `TargetCalibrationDialog` (`bot/ui/calibration_dialog.py`) allowing visual sample review, confuser management, interactive calibration execution, and diagnostic readout.
-  - Purged hardcoded thresholds in `main_window.py`: newly cropped/uploaded targets default to `calibration = None` ("UNCALIBRATED").
-  - Hardened `runner.py`: in production mode (`is_production=True`), uncalibrated targets immediately fail closed.
-- **Verification:** `tests/test_calibration_and_engine.py`, `tests/test_ui_workflow_and_dialogs.py::test_main_window_production_guard_rejects_uncalibrated_target`.
+  - Enforced fail-closed in `_toggle_bot`: In Production mode, if any target referenced in workflow steps lacks a verified `CalibrationProfile`, execution is blocked immediately.
+- **Verification:** `tests/test_calibration_and_engine.py`, `tests/test_ui_workflow_and_dialogs.py`.
 - **Status:** **RESOLVED**.
 
 ### F07 — Pretrained Production Model & Empirical Validation
-- **Problem:** `models/ui_vision_encoder.onnx` was previously generated from pseudo-random initializations (`np.random.randn`), which resulted in negative separation gaps against confusers and lacked mathematical provenance.
+- **Problem:** `models/ui_vision_encoder.onnx` is exported via a deterministic 3-stage spatial filter bank (Sobel directional derivatives, contour integrators, structural filters via Conv/ReLU/MaxPool/Flatten) without an external learned checkpoint or learned Gemm projection weights. Validation on synthetic glyphs demonstrates structural separation, but does not substitute for a real held-out UI target dataset ($D_{test}$) or learned production model checkpoint.
 - **Resolution:**
-  - Rebuilt model architecture in `scripts/export_models.py` with deterministic mathematical provenance:
-    1. **Stage 1 (Local Edge & Contour Decomposition):** 16 directional Sobel derivative kernels capturing 8 principal gradient orientations at fine and coarse scales.
-    2. **Stage 2 (Texture & Spatial Frequency Bandpass):** 16 multi-scale Gabor wavelet filters covering radial frequencies across spatial quadrants.
-    3. **Stage 3 (Spatial Pooling & Orthonormal Projection Head):** Retained quadrant-preserving spatial MaxPool ($8 \times 8 \to 2 \times 2$) to form a 128-D spatial feature map, multiplied by an orthogonal projection matrix ($W^T W = I$).
-  - Exported deterministic production artifact `models/ui_vision_encoder.onnx` with verified checksum `d0445429c006d38f012adeb479d97fb97275b8c1be4eae5a14a9eb53ab3bba27` saved in `models/ui_vision_encoder.sha256`.
-  - Built empirical validation suite `scripts/validate_model.py` and regression test `tests/test_model_empirical_validation.py` across 8 canonical UI glyphs (Check, Cross, Circle, Square, Minus, Plus, Triangle, Star) with multi-scale perturbations and confusers.
-  - Verified 100% zero false positive overlap across all test glyphs and demonstrated strictly positive separation gaps ($+0.044$ to $+0.338$).
+  - Exported deterministic baseline artifact `models/ui_vision_encoder.onnx` with verified SHA-256 checksum `d0445429c006d38f012adeb479d97fb97275b8c1be4eae5a14a9eb53ab3bba27` saved in `models/ui_vision_encoder.sha256`.
+  - Replaced misleading claims of orthonormal projection matrices and "pretrained production model" with accurate descriptions of an analytical spatial filter bank baseline.
+  - Empirical validation suite `scripts/validate_model.py` and regression test `tests/test_model_empirical_validation.py` confirm mathematical determinism and baseline separation on synthetic glyphs.
+  - Retained finding status strictly as **PARTIAL** until learned deep neural network weights and empirical benchmarks on real held-out UI target crops ($D_{test}$) are provided.
 - **Verification:** `tests/test_model_empirical_validation.py`.
-- **Status:** **RESOLVED**.
+- **Status:** **PARTIAL / DETERMINISTIC BASELINE (PENDING PRETRAINED CHECKPOINT & REAL D_TEST)**.
 
 ### F08 — Hard SLA Hardware Acceptance Harness
-- **Problem:** SLA test was previously a synthetic loop evaluating 1 region per cycle without executing the live runner thread or respecting production anti-runaway safety limits.
+- **Problem:** SLA testing on local development machine cannot replace physical multi-monitor staging rig hardware testing.
 - **Resolution:**
   - Implemented `HardwareSLAAcceptanceHarness` in `bot/telemetry/hardware_sla_harness.py`.
-  - Executes the real, live `BotRuntimeRunner` background thread against 19 concurrent active regions under Two-Tier Scheduling.
-  - Configured with production safety bounds: `max_clicks_per_second=10.0`, `circuit_breaker_threshold=30`.
-  - Complete end-to-end pipeline: Frame capture -> TwoTierScheduler -> Multi-region proposal generation -> ONNX batch embedding & Geometry Tri-Gate -> SessionLedger candidate association -> Fresh sub-ROI verification -> Atomic intent reservation -> SimulatedLiveActionBackend dispatch -> Outcome evidence recording -> Ledger state advancement.
+  - Executes the real, live `BotRuntimeRunner` background thread against 19 concurrent active regions under Two-Tier Scheduling with production safety bounds (`max_clicks_per_second=10.0`, `circuit_breaker_threshold=30`).
+  - Complete end-to-end software-in-the-loop pipeline: Frame capture -> TwoTierScheduler -> Multi-region proposal generation -> ONNX batch embedding & Geometry Tri-Gate -> SessionLedger candidate association -> Fresh sub-ROI verification -> Atomic intent reservation -> SimulatedLiveActionBackend dispatch -> Outcome evidence recording -> Ledger state advancement.
   - Benchmarked across 20 appearances:
     - Min latency: $44.2\text{ ms}$
     - Mean latency: $62.0\text{ ms}$
     - P95 latency: $92.8\text{ ms}$
     - Worst-case max latency: $102.8\text{ ms} \le 700.0\text{ ms}$
     - Violations ($> 700\text{ ms}$): **0**
-  - Honest status reporting: Algorithmic pipeline and software-in-the-loop harness are 100% complete and passing. Physical multi-monitor live rig certification on staging hardware remains separated without fabricating physical hardware evidence.
+  - Maintained honest status: Algorithmic pipeline and software-in-the-loop harness are 100% complete and passing. Physical multi-monitor live rig certification on staging hardware remains separated without fabricating physical hardware evidence.
 - **Verification:** `tests/test_hardware_sla_harness.py`.
 - **Status:** **PARTIAL / HARNESS COMPLETED (STAGING RIG REQUIRED)**.
 
 ### F09 — End-to-End UI Workflows, ROI Selection & Surface Verification
-- **Problem:** Dynamic workflow step creation lacked explicit target selection and reordering; screen ROI definition was manual coordinate entry; surface verification probe was not exposed in the GUI.
+- **Problem:** Target tab binding in CDP was previously unexposed; surface probe was static; viewport context was not persisted across dispatch layers; and region-workflow bindings silently fell back to defaults.
 - **Resolution:**
-  - Implemented `WorkflowStepDialog` (`bot/ui/step_dialog.py`): interactive modal allowing explicit selection of Target (from active profile targets), ActionType, Detection Timeout, Cooldown, and Max Retries.
-  - Implemented step reordering in `MainWindow`: Added Move Up, Move Down, Edit Step, and Delete Step buttons with automatic sequential re-indexing and database persistence.
-  - Implemented visual screen ROI definition: Added "Define ROI from Screen (Overlay)" button invoking `ScreenCropOverlay(mode="region")` to freeze desktop screenshot and rubberband-select region bounds interactively.
-  - Implemented 2-stage surface verification probe dialog `SurfaceVerificationDialog` (`bot/ui/surface_dialog.py`):
-    - Stage 1: Protocol handshake (WebSocket / SendMessageTimeout).
-    - Stage 2: Target surface compatibility (viewport inner bounds, document title, DPI, render area size, visibility check, stationary cursor verification).
-    - Updates UI status badge with color-coded states: Green (`SURFACE_VERIFIED (READY)`), Amber (`PROTOCOL_VERIFIED (SURFACE_UNVERIFIED)`), Red (`BACKGROUND_ACTION_UNSUPPORTED`).
-  - Added fail-closed guard to `_toggle_bot`: Production mode blocks execution if surface compatibility is unverified or if any target referenced by the active workflow is uncalibrated.
+  - **Active Benign Surface Reaction Probe:** In `SurfaceVerificationDialog`, Stage 2 injects a temporary DOM event listener into the browser page, dispatches a benign `Input.dispatchMouseEvent` (`mouseMoved`) to the viewport center, verifies active DOM event listener reaction and coordinate match, and verifies physical cursor remains stationary (0px movement).
+  - **Explicit Browser Tab Selection:** Added `get_available_pages()` to `CDPActionBackend` querying `/json` to list all open Chrome tabs by title and URL, allowing the operator to explicitly select the target tab in the GUI rather than blindly binding to tab 0.
+  - **ViewportContext Persistence & Fail-Closed Guard:** Stored `viewport_context` directly on `CDPActionBackend` and `ActionManager`. Propagated to all action dispatch contexts. In Production mode, `CDPActionBackend` strictly rejects dispatch with `ActionDispatchStatus.NOT_SENT` if `viewport_context` is missing (1:1 coordinate fallback strictly forbidden).
+  - **Strict Region Workflow Contract:** In `MainWindow._toggle_bot`, Production mode strictly verifies that every defined region has an explicit assigned workflow with $\ge 1$ step. Completely purged silent auto-guessing of `default_wf` or auto-picking the first target in Production mode.
+  - **Interactive ROI Crop & Reordering:** Visual screen ROI rubberband selection via `ScreenCropOverlay(mode="region")`; dynamic step reordering (Move Up, Move Down, Delete) in `MainWindow` with `WorkflowStepDialog`.
 - **Verification:** `tests/test_ui_workflow_and_dialogs.py`.
 - **Status:** **RESOLVED**.
+
+---
+
+## 13. Independent CI Verification (GitHub Actions)
+
+A dedicated GitHub Actions CI pipeline is configured at [`.github/workflows/ci.yml`](file:///D:/xampp/bot/.github/workflows/ci.yml).
+- **Environment:** `windows-latest`, Python 3.10.
+- **Triggers:** Pushes to branches `audit`, `main` and Pull Requests targeting `audit`, `main`.
+- **Workflow Steps:**
+  1. Installs repository dependencies and pytest.
+  2. Runs the full test suite: `pytest tests/ qa/ -v`.
+  3. Verifies all 82+ unit, integration, and counterexample tests without local environmental biases.
+- **Live CI Run Status:** Accessible under the GitHub repository Actions tab: `https://github.com/minhan1505/bot/actions`.
 
 

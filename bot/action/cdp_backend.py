@@ -39,22 +39,44 @@ class CDPActionBackend(BaseActionBackend):
         self.host = host
         self.port = port
         self.ws_url: Optional[str] = None
+        self.target_page_id: Optional[str] = None
+        self.viewport_context: Optional[ViewportContext] = None
         self._msg_id: int = 0
         self._ws_connection = None
 
-    def _get_page_ws_url(self) -> Optional[str]:
-        """Queries Chrome HTTP endpoint to locate active page websocket debugger URL."""
+    def get_available_pages(self) -> List[Dict[str, Any]]:
+        """Queries Chrome HTTP endpoint to locate all open page tabs."""
         try:
             url = f"http://{self.host}:{self.port}/json"
             req = urllib.request.Request(url, headers={"User-Agent": "BotV2-CDP"})
             with urllib.request.urlopen(req, timeout=2.0) as resp:
                 tabs = json.loads(resp.read().decode())
+                pages = []
                 for tab in tabs:
                     if tab.get("type") == "page" and "webSocketDebuggerUrl" in tab:
-                        return tab["webSocketDebuggerUrl"]
+                        pages.append({
+                            "id": tab.get("id"),
+                            "title": tab.get("title", "(untitled)"),
+                            "url": tab.get("url", ""),
+                            "webSocketDebuggerUrl": tab["webSocketDebuggerUrl"]
+                        })
+                return pages
         except Exception as e:
             logger.debug(f"Failed to query CDP pages at {self.host}:{self.port}: {e}")
-        return None
+        return []
+
+    def _get_page_ws_url(self, target_id: Optional[str] = None) -> Optional[str]:
+        """Queries Chrome HTTP endpoint to locate active page websocket debugger URL."""
+        target = target_id or self.target_page_id
+        pages = self.get_available_pages()
+        if not pages:
+            return None
+        if target:
+            for p in pages:
+                if p["id"] == target:
+                    return p["webSocketDebuggerUrl"]
+        # Default to first page if no explicit target ID specified
+        return pages[0]["webSocketDebuggerUrl"]
 
     def probe_capability(self, context: Dict[str, Any]) -> Tuple[bool, str]:
         """
@@ -65,8 +87,15 @@ class CDPActionBackend(BaseActionBackend):
         """
         cursor_before = get_physical_cursor_pos()
 
+        if "viewport_context" in context:
+            self.viewport_context = context["viewport_context"]
+        if "target_page_id" in context:
+            self.target_page_id = context["target_page_id"]
+        if "ws_url" in context:
+            self.ws_url = context["ws_url"]
+
         # Step 1: Query page WebSocket
-        ws_url = self._get_page_ws_url()
+        ws_url = self.ws_url or self._get_page_ws_url()
         if not ws_url:
             return False, f"CDP_UNAVAILABLE: Cannot connect to Chrome at http://{self.host}:{self.port}/json. Ensure Chrome is running with --remote-debugging-port={self.port}."
 
@@ -111,14 +140,22 @@ class CDPActionBackend(BaseActionBackend):
         Dispatches background mousePressed + mouseReleased via CDP Input.dispatchMouseEvent.
         Returns ActionDispatchResult distinguishing DISPATCHED, NOT_SENT, UNCERTAIN.
         """
+        # Convert Physical Screen Coordinates -> CSS Pixels if ViewportContext provided
+        viewport_ctx: Optional[ViewportContext] = context.get("viewport_context") or self.viewport_context
+        if context.get("is_production", False) and viewport_ctx is None:
+            logger.error("Production CDP dispatch rejected: Missing ViewportContext. 1:1 fallback is strictly forbidden.")
+            return ActionDispatchResult(
+                ActionDispatchStatus.NOT_SENT,
+                "Missing ViewportContext in production mode; 1:1 coordinate fallback is forbidden.",
+                target_screen_pt=(screen_x, screen_y)
+            )
+
         if not self.ws_url:
             self.ws_url = self._get_page_ws_url()
             if not self.ws_url:
                 logger.error("Cannot dispatch click: CDP WebSocket URL is unavailable.")
                 return ActionDispatchResult(ActionDispatchStatus.NOT_SENT, "CDP WebSocket URL is unavailable", target_screen_pt=(screen_x, screen_y))
 
-        # Convert Physical Screen Coordinates -> CSS Pixels if ViewportContext provided
-        viewport_ctx: Optional[ViewportContext] = context.get("viewport_context")
         if viewport_ctx:
             css_x, css_y = CoordinateMapper.screen_to_css_pixels(screen_x, screen_y, viewport_ctx)
             # Strict boundary check

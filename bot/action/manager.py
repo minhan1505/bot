@@ -49,6 +49,7 @@ class ActionManager:
         self.is_surface_verified = False
         self.support_status_message = "NOT_PROBED"
         self.emergency_stop_triggered = False
+        self.viewport_context = None
 
         # Anti-runaway tracking
         self._recent_click_timestamps = []
@@ -62,6 +63,10 @@ class ActionManager:
         Binds backend only if supported.
         """
         self.backend = backend
+        self.viewport_context = context.get("viewport_context")
+        if self.backend and hasattr(self.backend, "viewport_context") and self.viewport_context is not None:
+            self.backend.viewport_context = self.viewport_context
+
         supported, reason = self.backend.probe_capability(context)
         self.is_supported = supported
         self.is_protocol_verified = supported
@@ -95,6 +100,8 @@ class ActionManager:
         Safely dispatches action subject to safety guards.
         Returns ActionDispatchResult distinguishing DISPATCHED, UNCERTAIN, FAIL_CLOSED, NOT_SENT.
         """
+        if self.viewport_context is not None and "viewport_context" not in context:
+            context["viewport_context"] = self.viewport_context
         if self.emergency_stop_triggered:
             logger.warning("Action dispatch rejected: Emergency stop active.")
             return ActionDispatchResult(ActionDispatchStatus.FAIL_CLOSED, "Emergency stop active", target_screen_pt=(screen_x, screen_y))

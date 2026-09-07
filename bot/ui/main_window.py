@@ -584,7 +584,13 @@ class MainWindow(QMainWindow):
         if not target:
             return
 
-        dlg = TargetCalibrationDialog(target, self.vision_engine, parent=self)
+        dlg = TargetCalibrationDialog(
+            target=target,
+            profile=self.active_profile,
+            onnx_verifier=self.onnx_verifier,
+            geo_verifier=self.geo_verifier,
+            parent=self
+        )
         if dlg.exec() == QDialog.Accepted and dlg.calibrated_profile:
             target.calibration = dlg.calibrated_profile
             self.db.save_profile(self.active_profile)
@@ -785,6 +791,32 @@ class MainWindow(QMainWindow):
                                 )
                                 return
 
+                    # Contract requirement: Every region must have an explicit assigned workflow with >= 1 steps
+                    for r_id, reg in self.active_profile.regions.items():
+                        if not reg.workflow_id:
+                            QMessageBox.critical(
+                                self,
+                                "Execution Blocked (Fail-Closed)",
+                                f"Cannot start in Production mode: Region '{reg.name or r_id}' has no assigned workflow.\n"
+                                "Assign an explicit workflow with valid steps before starting in Production."
+                            )
+                            return
+                        if reg.workflow_id not in self.active_profile.workflows:
+                            QMessageBox.critical(
+                                self,
+                                "Execution Blocked (Fail-Closed)",
+                                f"Cannot start in Production mode: Region '{reg.name or r_id}' assigned workflow '{reg.workflow_id}' not found in profile."
+                            )
+                            return
+                        wf = self.active_profile.workflows[reg.workflow_id]
+                        if not wf.steps:
+                            QMessageBox.critical(
+                                self,
+                                "Execution Blocked (Fail-Closed)",
+                                f"Cannot start in Production mode: Workflow '{wf.name or reg.workflow_id}' assigned to region '{reg.name or r_id}' has 0 steps."
+                            )
+                            return
+
             if not self.active_profile or not self.active_profile.regions:
                 QMessageBox.warning(self, "No Regions", "Configure at least 1 region before starting bot.")
                 return
@@ -792,18 +824,15 @@ class MainWindow(QMainWindow):
             # Register regions with their designated workflows
             self.ledger = SessionLedger()
             default_wf = self.active_profile.workflows.get("default_workflow")
-            if not default_wf:
-                default_wf = Workflow(workflow_id="default_wf", name="Default")
-                if self.active_profile.targets:
-                    t_id = list(self.active_profile.targets.keys())[0]
-                    default_wf.steps.append(WorkflowStep(step_index=0, target_id=t_id))
 
             for r_id, reg in self.active_profile.regions.items():
                 wf_to_use = None
                 if reg.workflow_id and reg.workflow_id in self.active_profile.workflows:
                     wf_to_use = self.active_profile.workflows[reg.workflow_id]
-                else:
+                elif default_wf:
                     wf_to_use = default_wf
+                else:
+                    wf_to_use = Workflow(workflow_id=f"wf_{r_id}", name=f"WF {reg.name}")
                 inst = self.ledger.register_region(reg, wf_to_use)
                 inst.start_workflow()
 

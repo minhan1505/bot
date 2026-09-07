@@ -3,7 +3,8 @@ bot.ui.calibration_dialog
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 Interactive Target Calibration Wizard Dialog.
 Implements F06 Production Calibration Flow:
-  - Discards hardcoded threshold constants.
+  - Enforces two-set split on independent capture sessions: Session A (D_calib) and Session B (D_val).
+  - Strictly zero synthetic data generation or brightness shift fabrication.
   - Enforces Pre-Overlap Rejection on D_calib and Zero False Positives on D_val.
   - Computes empirical T_g, T_e, M_safe and separation gap.
   - Updates Target.calibration and saves profile.
@@ -12,20 +13,21 @@ Implements F06 Production Calibration Flow:
 import os
 import cv2
 import numpy as np
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 import logging
 
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QFileDialog, QMessageBox, QGroupBox, QFormLayout, QListWidget, QListWidgetItem
+    QFileDialog, QMessageBox, QGroupBox, QFormLayout, QTableWidget,
+    QTableWidgetItem, QHeaderView, QTabWidget, QWidget
 )
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QPixmap, QImage
+from PySide6.QtGui import QPixmap, QImage, QColor
 
 from bot.core.models import Target, Profile, CalibrationProfile
 from bot.vision.geometry import GeometryVerifier
 from bot.vision.onnx_verifier import ONNXVerifier
-from bot.vision.calibration import calibrate_target_from_samples, CalibrationOverlapError
+from bot.vision.calibration import CalibrationEngine, EvaluationSample, CalibrationOverlapError
 
 logger = logging.getLogger(__name__)
 
@@ -48,15 +50,16 @@ def np_to_qpixmap(img: np.ndarray, max_size: int = 128) -> QPixmap:
 class TargetCalibrationDialog(QDialog):
     """
     Production Calibration Wizard Dialog for a specific target.
+    Requires genuine, partitioned capture sessions without synthetic data fabrication.
     """
 
     def __init__(
         self,
-        parent,
         target: Target,
         profile: Profile,
         onnx_verifier: ONNXVerifier,
-        geo_verifier: GeometryVerifier
+        geo_verifier: GeometryVerifier,
+        parent=None
     ):
         super().__init__(parent)
         self.target = target
@@ -65,88 +68,80 @@ class TargetCalibrationDialog(QDialog):
         self.geo_verifier = geo_verifier
         self.calibrated_profile: Optional[CalibrationProfile] = None
 
-        self.setWindowTitle(f"Target Calibration Wizard - {target.name} ({target.target_id})")
-        self.resize(600, 520)
+        # Separate genuine samples by session: Session A (calib) and Session B (val)
+        # Seed Session A with existing reference image
+        self.session_a_pos: List[str] = list(self.target.reference_image_paths[:1]) if self.target.reference_image_paths else []
+        self.session_b_pos: List[str] = list(self.target.reference_image_paths[1:]) if len(self.target.reference_image_paths) > 1 else []
+
+        self.session_a_neg: List[str] = list(self.target.confuser_image_paths[:1]) if self.target.confuser_image_paths else []
+        self.session_b_neg: List[str] = list(self.target.confuser_image_paths[1:]) if len(self.target.confuser_image_paths) > 1 else []
+
+        self.setWindowTitle(f"Target Calibration Wizard - {target.name} [{target.target_id}]")
+        self.resize(700, 600)
         self._init_ui()
 
     def _init_ui(self):
         layout = QVBoxLayout(self)
 
         # 1. Target Preview Group
-        grp_target = QGroupBox("Target Information & Reference Image")
+        grp_target = QGroupBox("Target Information")
         target_layout = QHBoxLayout(grp_target)
 
         self.lbl_preview = QLabel()
-        self.lbl_preview.setFixedSize(128, 128)
+        self.lbl_preview.setFixedSize(100, 100)
         self.lbl_preview.setAlignment(Qt.AlignCenter)
-        self.lbl_preview.setStyleSheet("border: 1px solid #ccc; background: #222;")
+        self.lbl_preview.setStyleSheet("border: 1px solid #555; background: #222;")
 
-        ref_img = None
         if self.target.reference_image_paths and os.path.exists(self.target.reference_image_paths[0]):
             ref_img = cv2.imread(self.target.reference_image_paths[0])
             if ref_img is not None:
-                self.lbl_preview.setPixmap(np_to_qpixmap(ref_img))
+                self.lbl_preview.setPixmap(np_to_qpixmap(ref_img, max_size=96))
 
         info_layout = QFormLayout()
         info_layout.addRow("Target ID:", QLabel(self.target.target_id))
         info_layout.addRow("Target Name:", QLabel(self.target.name))
-        current_status = "Calibrated" if self.target.calibration else "Uncalibrated (Production Action Locked)"
+        current_status = "Calibrated" if self.target.calibration else "UNCALIBRATED (Production Action Locked)"
         status_color = "#2e7d32" if self.target.calibration else "#c62828"
         lbl_status = QLabel(current_status)
         lbl_status.setStyleSheet(f"font-weight: bold; color: {status_color};")
-        info_layout.addRow("Calibration Status:", lbl_status)
+        info_layout.addRow("Current Status:", lbl_status)
 
         target_layout.addWidget(self.lbl_preview)
         target_layout.addLayout(info_layout)
         layout.addWidget(grp_target)
 
-        # 2. Confusers & Competitors Group
-        grp_confusers = QGroupBox("Explicit Operational Confusers & Competitors")
-        confusers_layout = QVBoxLayout(grp_confusers)
+        # 2. Tabs for Session A (D_calib) and Session B (D_val)
+        tabs_session = QTabWidget()
+        tabs_session.addTab(self._create_session_tab("A"), "Session A — Calibration Set (D_calib)")
+        tabs_session.addTab(self._create_session_tab("B"), "Session B — Validation Set (D_val)")
+        layout.addWidget(tabs_session)
 
-        self.list_confusers = QListWidget()
-        self._refresh_confusers_list()
-        confusers_layout.addWidget(self.list_confusers)
+        # 3. Diagnostic Readout
+        grp_diag = QGroupBox("Empirical Thresholds & Separation Diagnostics")
+        self.diag_layout = QFormLayout(grp_diag)
+        self.lbl_tg = QLabel("T_g (Geometry): Not Calibrated")
+        self.lbl_te = QLabel("T_e (Embedding): Not Calibrated")
+        self.lbl_msafe = QLabel("M_safe (Competitor Margin): Not Calibrated")
+        self.lbl_gap = QLabel("Separation Gap: Not Calibrated")
 
-        btn_row = QHBoxLayout()
-        btn_add_confuser = QPushButton("Add Confuser Image(s)...")
-        btn_add_confuser.clicked.connect(self._add_confuser_images)
-        btn_remove_confuser = QPushButton("Remove Selected Confuser")
-        btn_remove_confuser.clicked.connect(self._remove_selected_confuser)
-        btn_row.addWidget(btn_add_confuser)
-        btn_row.addWidget(btn_remove_confuser)
-        confusers_layout.addLayout(btn_row)
-        layout.addWidget(grp_confusers)
-
-        # 3. Calibration Metrics Group
-        self.grp_results = QGroupBox("Data-Driven Calibration Results (Zero Heuristics)")
-        self.res_layout = QFormLayout(self.grp_results)
-
-        self.lbl_tg = QLabel("—")
-        self.lbl_te = QLabel("—")
-        self.lbl_msafe = QLabel("—")
-        self.lbl_gap = QLabel("—")
-        self.lbl_result_status = QLabel("Ready to calibrate")
-
-        self.res_layout.addRow("Geometry Threshold (T_g):", self.lbl_tg)
-        self.res_layout.addRow("Embedding Threshold (T_e):", self.lbl_te)
-        self.res_layout.addRow("Safety Margin (M_safe):", self.lbl_msafe)
-        self.res_layout.addRow("Separation Gap:", self.lbl_gap)
-        self.res_layout.addRow("Validation Result:", self.lbl_result_status)
-        layout.addWidget(self.grp_results)
+        self.diag_layout.addRow(self.lbl_tg)
+        self.diag_layout.addRow(self.lbl_te)
+        self.diag_layout.addRow(self.lbl_msafe)
+        self.diag_layout.addRow(self.lbl_gap)
+        layout.addWidget(grp_diag)
 
         # 4. Action Buttons
         actions_layout = QHBoxLayout()
         self.btn_run_calib = QPushButton("Run Empirical Calibration")
-        self.btn_run_calib.setStyleSheet("background-color: #1976d2; color: white; font-weight: bold; padding: 6px 16px;")
+        self.btn_run_calib.setStyleSheet("background-color: #1565c0; color: white; font-weight: bold; padding: 8px 16px;")
         self.btn_run_calib.clicked.connect(self._run_calibration)
 
-        self.btn_save = QPushButton("Save & Apply Calibration")
+        self.btn_save = QPushButton("Accept & Save Profile")
         self.btn_save.setEnabled(False)
-        self.btn_save.setStyleSheet("background-color: #2e7d32; color: white; font-weight: bold; padding: 6px 16px;")
-        self.btn_save.clicked.connect(self._save_and_apply)
+        self.btn_save.setStyleSheet("background-color: #2e7d32; color: white; font-weight: bold; padding: 8px 16px;")
+        self.btn_save.clicked.connect(self.accept)
 
-        btn_cancel = QPushButton("Close")
+        btn_cancel = QPushButton("Cancel")
         btn_cancel.clicked.connect(self.reject)
 
         actions_layout.addWidget(self.btn_run_calib)
@@ -154,124 +149,244 @@ class TargetCalibrationDialog(QDialog):
         actions_layout.addWidget(btn_cancel)
         layout.addLayout(actions_layout)
 
-    def _refresh_confusers_list(self):
-        self.list_confusers.clear()
-        # Add target confuser paths
-        for p in self.target.confuser_image_paths:
-            self.list_confusers.addItem(f"[Explicit Confuser] {os.path.basename(p)} ({p})")
-        # Also display profile alternative targets
-        for oid, ot in self.profile.targets.items():
-            if oid != self.target.target_id:
-                self.list_confusers.addItem(f"[Competitor Target] {ot.name} ({oid})")
+        self._refresh_tables()
 
-    def _add_confuser_images(self):
-        files, _ = QFileDialog.getOpenFileNames(
-            self, "Select Confuser Image(s)", "", "Images (*.png *.jpg *.bmp)"
-        )
+    def _create_session_tab(self, session_key: str) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+
+        # Positive Samples
+        lbl_pos = QLabel(f"Real Positive Samples for Session {session_key} (Must be real captures of this target):")
+        layout.addWidget(lbl_pos)
+
+        table_pos = QTableWidget(0, 1)
+        table_pos.setHorizontalHeaderLabels(["Sample Image Path"])
+        table_pos.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        setattr(self, f"table_pos_{session_key.lower()}", table_pos)
+        layout.addWidget(table_pos)
+
+        btn_bar_pos = QHBoxLayout()
+        btn_add_pos = QPushButton(f"Add Positive Sample(s) to Session {session_key}...")
+        btn_add_pos.clicked.connect(lambda _, s=session_key: self._add_positive_sample(s))
+        btn_bar_pos.addWidget(btn_add_pos)
+
+        btn_del_pos = QPushButton(f"Remove Selected")
+        btn_del_pos.clicked.connect(lambda _, s=session_key: self._remove_positive_sample(s))
+        btn_bar_pos.addWidget(btn_del_pos)
+        btn_bar_pos.addStretch()
+        layout.addLayout(btn_bar_pos)
+
+        # Confuser / Negative Samples
+        lbl_neg = QLabel(f"Real Confuser / Negative Samples for Session {session_key}:")
+        layout.addWidget(lbl_neg)
+
+        table_neg = QTableWidget(0, 1)
+        table_neg.setHorizontalHeaderLabels(["Confuser Image Path"])
+        table_neg.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        setattr(self, f"table_neg_{session_key.lower()}", table_neg)
+        layout.addWidget(table_neg)
+
+        btn_bar_neg = QHBoxLayout()
+        btn_add_neg = QPushButton(f"Add Confuser(s) to Session {session_key}...")
+        btn_add_neg.clicked.connect(lambda _, s=session_key: self._add_confuser_sample(s))
+        btn_bar_neg.addWidget(btn_add_neg)
+
+        btn_del_neg = QPushButton(f"Remove Selected")
+        btn_del_neg.clicked.connect(lambda _, s=session_key: self._remove_confuser_sample(s))
+        btn_bar_neg.addWidget(btn_del_neg)
+        btn_bar_neg.addStretch()
+        layout.addLayout(btn_bar_neg)
+
+        return widget
+
+    def _refresh_tables(self):
+        # Refresh Session A
+        t_pos_a = getattr(self, "table_pos_a")
+        t_pos_a.setRowCount(0)
+        for p in self.session_a_pos:
+            r = t_pos_a.rowCount()
+            t_pos_a.insertRow(r)
+            t_pos_a.setItem(r, 0, QTableWidgetItem(p))
+
+        t_neg_a = getattr(self, "table_neg_a")
+        t_neg_a.setRowCount(0)
+        for p in self.session_a_neg:
+            r = t_neg_a.rowCount()
+            t_neg_a.insertRow(r)
+            t_neg_a.setItem(r, 0, QTableWidgetItem(p))
+
+        # Refresh Session B
+        t_pos_b = getattr(self, "table_pos_b")
+        t_pos_b.setRowCount(0)
+        for p in self.session_b_pos:
+            r = t_pos_b.rowCount()
+            t_pos_b.insertRow(r)
+            t_pos_b.setItem(r, 0, QTableWidgetItem(p))
+
+        t_neg_b = getattr(self, "table_neg_b")
+        t_neg_b.setRowCount(0)
+        for p in self.session_b_neg:
+            r = t_neg_b.rowCount()
+            t_neg_b.insertRow(r)
+            t_neg_b.setItem(r, 0, QTableWidgetItem(p))
+
+    def _add_positive_sample(self, session_key: str):
+        files, _ = QFileDialog.getOpenFileNames(self, f"Select Positive Sample(s) for Session {session_key}", "", "Images (*.png *.jpg *.bmp)")
         if files:
+            target_list = self.session_a_pos if session_key == "A" else self.session_b_pos
             for f in files:
-                if f not in self.target.confuser_image_paths:
-                    self.target.confuser_image_paths.append(f)
-            self._refresh_confusers_list()
+                if f not in target_list:
+                    target_list.append(f)
+            self._refresh_tables()
 
-    def _remove_selected_confuser(self):
-        item = self.list_confusers.currentItem()
-        if not item:
-            return
-        text = item.text()
-        for p in list(self.target.confuser_image_paths):
-            if p in text:
-                self.target.confuser_image_paths.remove(p)
-        self._refresh_confusers_list()
+    def _remove_positive_sample(self, session_key: str):
+        table = getattr(self, f"table_pos_{session_key.lower()}")
+        row = table.currentRow()
+        if row >= 0:
+            target_list = self.session_a_pos if session_key == "A" else self.session_b_pos
+            if row < len(target_list):
+                target_list.pop(row)
+            self._refresh_tables()
+
+    def _add_confuser_sample(self, session_key: str):
+        files, _ = QFileDialog.getOpenFileNames(self, f"Select Confuser(s) for Session {session_key}", "", "Images (*.png *.jpg *.bmp)")
+        if files:
+            target_list = self.session_a_neg if session_key == "A" else self.session_b_neg
+            for f in files:
+                if f not in target_list:
+                    target_list.append(f)
+            self._refresh_tables()
+
+    def _remove_confuser_sample(self, session_key: str):
+        table = getattr(self, f"table_neg_{session_key.lower()}")
+        row = table.currentRow()
+        if row >= 0:
+            target_list = self.session_a_neg if session_key == "A" else self.session_b_neg
+            if row < len(target_list):
+                target_list.pop(row)
+            self._refresh_tables()
 
     def _run_calibration(self):
-        if not self.target.reference_image_paths or not os.path.exists(self.target.reference_image_paths[0]):
-            QMessageBox.critical(self, "Missing Reference", "Target has no valid reference image.")
-            return
-
-        ref_img = cv2.imread(self.target.reference_image_paths[0])
-        if ref_img is None:
-            QMessageBox.critical(self, "Invalid Image", "Cannot load reference image.")
-            return
-
-        # Prepare competitor / alternative identity images
-        alt_imgs: Dict[str, np.ndarray] = {}
-        for oid, ot in self.profile.targets.items():
-            if oid != self.target.target_id and ot.reference_image_paths and os.path.exists(ot.reference_image_paths[0]):
-                aimg = cv2.imread(ot.reference_image_paths[0])
-                if aimg is not None:
-                    alt_imgs[oid] = aimg
-
-        for idx, cpath in enumerate(self.target.confuser_image_paths):
-            if os.path.exists(cpath):
-                cimg = cv2.imread(cpath)
-                if cimg is not None:
-                    alt_imgs[f"confuser_{idx}"] = cimg
-
-        if not alt_imgs:
+        # Strict Precondition Check: Zero synthetic fabrication
+        if len(self.session_a_pos) < 1 or len(self.session_b_pos) < 1:
             QMessageBox.warning(
                 self,
-                "CALIBRATION_BLOCKED_MISSING_CONFUSERS",
-                "Cannot calibrate without at least 1 competitor target or explicit confuser.\n"
-                "Add an explicit confuser image or create another target to establish M_safe."
+                "MISSING_SESSION_POS_SAMPLES",
+                "Data-driven calibration requires independent capture sessions.\n"
+                "Please provide at least 1 real positive sample for Session A (D_calib) "
+                "and at least 1 real positive sample for Session B (D_val).\n"
+                "Synthetic duplication or brightness shifts are strictly prohibited."
             )
             return
 
-        # Generate empirical positive samples (varied illuminations, scales, and Gaussian noise)
-        pos_samples = [ref_img]
-        for shift in [-15, -8, 8, 15]:
-            var = np.clip(ref_img.astype(np.int16) + shift, 0, 255).astype(np.uint8)
-            pos_samples.append(var)
+        if len(self.session_a_neg) < 1 or len(self.session_b_neg) < 1:
+            # Also check if profile has alternative competitor targets to populate negatives
+            competitor_imgs = []
+            for oid, ot in self.profile.targets.items():
+                if oid != self.target.target_id and ot.reference_image_paths and os.path.exists(ot.reference_image_paths[0]):
+                    competitor_imgs.append(ot.reference_image_paths[0])
 
-        # Negative samples from competitors and confusers
-        neg_samples = list(alt_imgs.values())
-        if len(neg_samples) < 2:
-            # Duplicate with mild transform to satisfy partition requirement
-            neg_samples.append(np.clip(neg_samples[0].astype(np.int16) + 10, 0, 255).astype(np.uint8))
+            if len(self.session_a_neg) < 1 and competitor_imgs:
+                self.session_a_neg.append(competitor_imgs[0])
+            if len(self.session_b_neg) < 1 and len(competitor_imgs) > 1:
+                self.session_b_neg.append(competitor_imgs[1])
+            elif len(self.session_b_neg) < 1 and len(self.session_a_neg) > 1:
+                self.session_b_neg.append(self.session_a_neg.pop())
+
+            self._refresh_tables()
+
+            if len(self.session_a_neg) < 1 or len(self.session_b_neg) < 1:
+                QMessageBox.warning(
+                    self,
+                    "MISSING_SESSION_CONFUSERS",
+                    "Data-driven calibration requires at least 1 confuser/competitor sample for Session A "
+                    "and 1 for Session B to establish competitor margins.\n"
+                    "Add confuser image files to both sessions before running calibration."
+                )
+                return
+
+        # Load real images
+        pos_a_imgs = [cv2.imread(p) for p in self.session_a_pos if os.path.exists(p)]
+        pos_b_imgs = [cv2.imread(p) for p in self.session_b_pos if os.path.exists(p)]
+        neg_a_imgs = [cv2.imread(p) for p in self.session_a_neg if os.path.exists(p)]
+        neg_b_imgs = [cv2.imread(p) for p in self.session_b_neg if os.path.exists(p)]
+
+        pos_a_imgs = [img for img in pos_a_imgs if img is not None]
+        pos_b_imgs = [img for img in pos_b_imgs if img is not None]
+        neg_a_imgs = [img for img in neg_a_imgs if img is not None]
+        neg_b_imgs = [img for img in neg_b_imgs if img is not None]
+
+        if not pos_a_imgs or not pos_b_imgs or not neg_a_imgs or not neg_b_imgs:
+            QMessageBox.critical(self, "Image Read Error", "Failed to load image files from disk. Verify file paths.")
+            return
+
+        ref_img = pos_a_imgs[0]
+
+        # Construct competitor alternative targets dictionary
+        alt_imgs: Dict[str, np.ndarray] = {}
+        for idx, img in enumerate(neg_a_imgs + neg_b_imgs):
+            alt_imgs[f"confuser_{idx}"] = img
+
+        # Construct genuine, partitioned evaluation samples
+        d_calib = [
+            EvaluationSample(image=img, is_positive=True, label=self.target.target_id, session_id="session_A", device_id="dev_0")
+            for img in pos_a_imgs
+        ] + [
+            EvaluationSample(image=img, is_positive=False, label="confuser", session_id="session_A", device_id="dev_0")
+            for img in neg_a_imgs
+        ]
+
+        d_val = [
+            EvaluationSample(image=img, is_positive=True, label=self.target.target_id, session_id="session_B", device_id="dev_0")
+            for img in pos_b_imgs
+        ] + [
+            EvaluationSample(image=img, is_positive=False, label="confuser", session_id="session_B", device_id="dev_0")
+            for img in neg_b_imgs
+        ]
 
         try:
-            profile = calibrate_target_from_samples(
-                target_id=self.target.target_id,
-                target_reference_img=ref_img,
-                positive_images=pos_samples,
-                negative_images=neg_samples,
-                alternative_identity_imgs=alt_imgs,
-                geo_verifier=self.geo_verifier,
+            engine = CalibrationEngine(
+                geometry_verifier=self.geo_verifier,
                 onnx_verifier=self.onnx_verifier,
                 canonical_size=(64, 64)
             )
+            calib_result = engine.calibrate_target(
+                target_id=self.target.target_id,
+                target_reference_img=ref_img,
+                d_calib=d_calib,
+                d_val=d_val,
+                alternative_identity_imgs=alt_imgs
+            )
 
-            self.calibrated_profile = profile
-            self.lbl_tg.setText(f"{profile.t_g:.4f}")
-            self.lbl_te.setText(f"{profile.t_e:.4f}")
-            self.lbl_msafe.setText(f"{profile.m_safe:.4f}")
-            self.lbl_gap.setText(f"+{profile.separation_gap:.4f} (Pos Min: {profile.min_pos_sim:.3f}, Neg Max: {profile.max_neg_sim:.3f})")
-            self.lbl_result_status.setText("CALIBRATION_PASSED (Zero Overlap & 0 FP)")
-            self.lbl_result_status.setStyleSheet("color: #2e7d32; font-weight: bold;")
+            self.calibrated_profile = calib_result
+            self.lbl_tg.setText(f"T_g (Geometry): {calib_result.t_g:.4f}")
+            self.lbl_te.setText(f"T_e (Embedding): {calib_result.t_e:.4f}")
+            self.lbl_msafe.setText(f"M_safe (Competitor Margin): {calib_result.m_safe:.4f}")
+            self.lbl_gap.setText(f"Separation Gap: +{calib_result.separation_gap:.4f} (PASSED Zero-Overlap)")
+            self.lbl_gap.setStyleSheet("color: #2e7d32; font-weight: bold;")
+
+            # Persist real sample paths into target
+            all_pos = list(dict.fromkeys(self.session_a_pos + self.session_b_pos))
+            all_neg = list(dict.fromkeys(self.session_a_neg + self.session_b_neg))
+            self.target.reference_image_paths = all_pos
+            self.target.confuser_image_paths = all_neg
+            self.target.calibration = calib_result
+
             self.btn_save.setEnabled(True)
-
             QMessageBox.information(
                 self,
                 "Calibration Succeeded",
-                f"Data-driven calibration successful!\n\n"
-                f"Geometry Threshold (T_g): {profile.t_g:.4f}\n"
-                f"Embedding Threshold (T_e): {profile.t_e:.4f}\n"
-                f"Safety Margin (M_safe): {profile.m_safe:.4f}\n"
-                f"Separation Gap: +{profile.separation_gap:.4f}\n\n"
-                f"Zero False Positives verified on Held-Out D_val."
+                f"Data-driven calibration passed with zero false positives!\n"
+                f"T_g={calib_result.t_g:.3f}, T_e={calib_result.t_e:.3f}, M_safe={calib_result.m_safe:.3f}\n"
+                f"Held-Out Separation Gap: +{calib_result.separation_gap:.3f}"
             )
-        except CalibrationOverlapError as err:
-            self.lbl_result_status.setText(f"REJECTED: {err}")
-            self.lbl_result_status.setStyleSheet("color: #c62828; font-weight: bold;")
-            self.btn_save.setEnabled(False)
-            QMessageBox.warning(self, "Calibration Rejected", f"Calibration rejected by Pre-Overlap Gate:\n\n{err}")
-        except Exception as ex:
-            self.lbl_result_status.setText(f"ERROR: {ex}")
-            self.lbl_result_status.setStyleSheet("color: #c62828; font-weight: bold;")
-            self.btn_save.setEnabled(False)
-            QMessageBox.critical(self, "Calibration Error", f"Unexpected error during calibration:\n{ex}")
 
-    def _save_and_apply(self):
-        if self.calibrated_profile:
-            self.target.calibration = self.calibrated_profile
-            self.accept()
+        except CalibrationOverlapError as exc:
+            self.lbl_gap.setText(f"FAILED: {exc}")
+            self.lbl_gap.setStyleSheet("color: #c62828; font-weight: bold;")
+            QMessageBox.critical(
+                self,
+                "Calibration Rejected",
+                f"Empirical calibration failed safety acceptance criteria:\n{exc}\n"
+                "Target distributions overlap or produce false positives. Add more distinct samples or adjust confusers."
+            )
