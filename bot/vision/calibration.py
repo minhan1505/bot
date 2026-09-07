@@ -234,3 +234,63 @@ class CalibrationEngine:
             sample_count_pos=len(calib_g_pos) + len(val_e_pos),
             sample_count_neg=len(calib_g_neg) + len(val_e_neg)
         )
+
+
+def calibrate_target_from_samples(
+    target_id: str,
+    target_reference_img: np.ndarray,
+    positive_images: List[np.ndarray],
+    negative_images: List[np.ndarray],
+    alternative_identity_imgs: Optional[Dict[str, np.ndarray]],
+    geo_verifier: GeometryVerifier,
+    onnx_verifier: ONNXVerifier,
+    canonical_size: Tuple[int, int] = (64, 64)
+) -> CalibrationProfile:
+    """
+    High-level convenience orchestrator that prepares session-partitioned D_calib and D_val
+    and executes CalibrationEngine.calibrate_target.
+    Enforces disjoint session IDs to prevent data leakage.
+    """
+    if len(positive_images) < 2:
+        raise ValueError("At least 2 positive samples (Session A and Session B) are required for calibration and validation.")
+    if len(negative_images) < 2:
+        raise ValueError("At least 2 negative/confuser samples are required for calibration and validation.")
+    if not alternative_identity_imgs:
+        raise CalibrationOverlapError(
+            f"CALIBRATION_BLOCKED_MISSING_CONFUSERS: Target '{target_id}' has no competitor targets or confusers configured."
+        )
+
+    # Split positive samples into Session A (calib) and Session B (val)
+    mid_pos = max(1, len(positive_images) // 2)
+    pos_calib = positive_images[:mid_pos]
+    pos_val = positive_images[mid_pos:]
+
+    # Split negative samples into Session A (calib) and Session B (val)
+    mid_neg = max(1, len(negative_images) // 2)
+    neg_calib = negative_images[:mid_neg]
+    neg_val = negative_images[mid_neg:]
+
+    d_calib = [
+        EvaluationSample(image=img, is_positive=True, label=target_id, session_id="session_A", device_id="dev_0")
+        for img in pos_calib
+    ] + [
+        EvaluationSample(image=img, is_positive=False, label="negative", session_id="session_A", device_id="dev_0")
+        for img in neg_calib
+    ]
+
+    d_val = [
+        EvaluationSample(image=img, is_positive=True, label=target_id, session_id="session_B", device_id="dev_0")
+        for img in pos_val
+    ] + [
+        EvaluationSample(image=img, is_positive=False, label="negative", session_id="session_B", device_id="dev_0")
+        for img in neg_val
+    ]
+
+    engine = CalibrationEngine(geometry_verifier=geo_verifier, onnx_verifier=onnx_verifier, canonical_size=canonical_size)
+    return engine.calibrate_target(
+        target_id=target_id,
+        target_reference_img=target_reference_img,
+        d_calib=d_calib,
+        d_val=d_val,
+        alternative_identity_imgs=alternative_identity_imgs
+    )

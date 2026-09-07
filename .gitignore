@@ -57,6 +57,7 @@ logs/*.log
 
 # Runtime generated license files
 license.dat
+data/benchmark_targets/
 
 # IDEs
 .vscode/

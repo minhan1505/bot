@@ -8,6 +8,8 @@ Executes the unified live pipeline:
 Runs on a background thread to ensure GUI remains 100% responsive.
 """
 
+import os
+import cv2
 import time
 import threading
 from typing import Dict, Optional, Callable, List
@@ -238,41 +240,63 @@ class BotRuntimeRunner:
                                         continue
 
                                     # Fast tri-condition confirmation on fresh frame
-                                    g_fresh = 1.0
+                                    calib = target_cfg.calibration
+                                    if calib is None:
+                                        if self.is_production:
+                                            reason = f"Target '{expected_target_id}' uncalibrated: missing CalibrationProfile in production."
+                                            logger.error(f"Region {owner_region}: {reason}")
+                                            inst.on_fresh_verify_failed(reason)
+                                            continue
+                                        t_g, t_e, m_safe = 0.5, 0.65, 0.05
+                                    else:
+                                        t_g, t_e, m_safe = calib.t_g, calib.t_e, calib.m_safe
+
+                                    g_fresh = 0.0
+                                    geo_fresh_pass = False
                                     if hasattr(self.vision_engine, "geo_verifier") and self.vision_engine.geo_verifier is not None:
                                         g_fresh = self.vision_engine.geo_verifier.compute_geometry_score(fresh_crop, ref_img)
+                                        geo_fresh_pass = (g_fresh >= t_g)
 
-                                    calib = target_cfg.calibration
-                                    t_g = calib.t_g if calib else 0.5
-                                    t_e = calib.t_e if calib else 0.65
-                                    m_safe = calib.m_safe if calib else 0.05
-
-                                    geo_fresh_pass = (g_fresh >= t_g)
-
-                                    emb_fresh_pass = True
-                                    margin_fresh_pass = True
+                                    emb_fresh_pass = True if not self.is_production else False
+                                    margin_fresh_pass = True if not self.is_production else False
 
                                     if hasattr(self.vision_engine, "onnx_verifier") and self.vision_engine.onnx_verifier is not None:
                                         fresh_emb = self.vision_engine.onnx_verifier.compute_embeddings([fresh_crop])[0]
                                         target_emb = self.vision_engine.onnx_verifier.get_cached_target_embedding(expected_target_id, [ref_img])
+                                        if target_emb is None:
+                                            self.vision_engine.onnx_verifier.cache_target_embedding(expected_target_id, [ref_img])
+                                            target_emb = self.vision_engine.onnx_verifier.get_cached_target_embedding(expected_target_id, [ref_img])
                                         e_fresh = self.vision_engine.onnx_verifier.cosine_similarity(fresh_emb, target_emb) if target_emb is not None else 0.0
                                         emb_fresh_pass = (e_fresh >= t_e)
 
-                                        if alt_targets:
-                                            competitor_scores = [
-                                                self.vision_engine.onnx_verifier.cosine_similarity(
-                                                    fresh_emb,
-                                                    self.vision_engine.onnx_verifier.get_cached_target_embedding(aid, [aimg])
-                                                )
-                                                for aid, aimg in alt_targets.items()
-                                                if self.vision_engine.onnx_verifier.get_cached_target_embedding(aid, [aimg]) is not None
-                                            ]
+                                        # Collect competitor targets including explicit confusers
+                                        fresh_competitors = dict(alt_targets) if alt_targets else {}
+                                        if target_cfg.confuser_image_paths:
+                                            for c_idx, c_path in enumerate(target_cfg.confuser_image_paths):
+                                                if os.path.exists(c_path):
+                                                    c_img = cv2.imread(c_path)
+                                                    if c_img is not None:
+                                                        fresh_competitors[f"{expected_target_id}_confuser_{c_idx}"] = c_img
+
+                                        if fresh_competitors:
+                                            competitor_scores = []
+                                            for aid, aimg in fresh_competitors.items():
+                                                c_emb = self.vision_engine.onnx_verifier.get_cached_target_embedding(aid, [aimg])
+                                                if c_emb is None:
+                                                    self.vision_engine.onnx_verifier.cache_target_embedding(aid, [aimg])
+                                                    c_emb = self.vision_engine.onnx_verifier.get_cached_target_embedding(aid, [aimg])
+                                                if c_emb is not None:
+                                                    sim = self.vision_engine.onnx_verifier.cosine_similarity(fresh_emb, c_emb)
+                                                    competitor_scores.append(sim)
+
                                             if competitor_scores:
                                                 best_comp = max(competitor_scores)
                                                 margin_fresh_pass = ((e_fresh - best_comp) >= m_safe)
+                                        else:
+                                            margin_fresh_pass = True if not self.is_production else False
 
                                     if not (geo_fresh_pass and emb_fresh_pass and margin_fresh_pass):
-                                        reason = f"Fresh verify tri-gate failed: G={g_fresh:.3f}/{t_g}"
+                                        reason = f"Fresh verify tri-gate failed: G={g_fresh:.3f}/{t_g} (pass={geo_fresh_pass}), E={e_fresh:.3f}/{t_e} (pass={emb_fresh_pass}), M_pass={margin_fresh_pass}"
                                         logger.warning(f"Region {owner_region}: {reason}")
                                         inst.on_fresh_verify_failed(reason)
                                         continue
