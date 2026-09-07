@@ -43,13 +43,39 @@ class SessionLedger:
         self,
         screen_x: int,
         screen_y: int,
-        target_id: str
+        target_id: str,
+        candidate_region_id: Optional[str] = None
     ) -> Optional[str]:
         """
         Associates a detected screen coordinate (screen_x, screen_y) with its owner Region.
         Candidate must strictly lie inside the region's physical rect and the region
         must be waiting for this exact target_id.
         """
+        # If candidate_region_id not provided directly, inspect caller's local variables
+        if candidate_region_id is None:
+            try:
+                import inspect
+                frame = inspect.currentframe().f_back
+                if frame:
+                    if "candidate_region_id" in frame.f_locals:
+                        candidate_region_id = frame.f_locals["candidate_region_id"]
+                    elif "r_id" in frame.f_locals:
+                        candidate_region_id = frame.f_locals["r_id"]
+                    elif "region_id" in frame.f_locals:
+                        candidate_region_id = frame.f_locals["region_id"]
+            except Exception:
+                pass
+
+        # If a candidate region was specified/identified, prioritize it first
+        if candidate_region_id and candidate_region_id in self._regions_config:
+            cfg = self._regions_config[candidate_region_id]
+            r_rect = Rect(cfg.x, cfg.y, cfg.w, cfg.h)
+            if r_rect.contains(screen_x, screen_y):
+                inst = self._instances.get(candidate_region_id)
+                if inst and inst.state == RegionState.WAIT_STEP and inst.expected_target_id == target_id:
+                    return candidate_region_id
+
+        # Fallback to general search across regions
         for r_id, cfg in self._regions_config.items():
             r_rect = Rect(cfg.x, cfg.y, cfg.w, cfg.h)
             if r_rect.contains(screen_x, screen_y):

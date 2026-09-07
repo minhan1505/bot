@@ -42,6 +42,9 @@ class TwoTierScheduler:
             if inst.state != RegionState.WAIT_STEP:
                 continue
 
+            if inst.is_in_cooldown():
+                continue
+
             target_id = inst.expected_target_id
             if not target_id:
                 continue

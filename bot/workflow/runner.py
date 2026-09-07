@@ -14,7 +14,7 @@ from typing import Dict, Optional, Callable, List
 import numpy as np
 import logging
 
-from bot.core.models import Profile, Target, DecisionResult, DecisionClass
+from bot.core.models import Profile, Target, DecisionResult, DecisionClass, ActionType
 from bot.core.coordinates import Rect
 from bot.capture.manager import CaptureManager
 from bot.vision.engine import VisionEngine
@@ -178,7 +178,10 @@ class BotRuntimeRunner:
                             cand_cy = res.candidate_rect[1] + res.candidate_rect[3] // 2
 
                             # Associate candidate with Region
-                            owner_region = self.ledger.associate_candidate(cand_cx, cand_cy, expected_target_id)
+                            candidate_region_id = r_id
+                            owner_region = self.ledger.associate_candidate(
+                                cand_cx, cand_cy, expected_target_id, candidate_region_id=r_id
+                            )
                             if owner_region:
                                 inst = self.ledger.get_instance(owner_region)
                                 if inst:
@@ -194,14 +197,24 @@ class BotRuntimeRunner:
                                         if g_fresh >= (target_cfg.calibration.t_g if target_cfg.calibration else 0.5):
                                             inst.on_fresh_verified()
 
-                                            # Dispatch action if NOT dry run
-                                            if not self.is_dry_run:
+                                            step = inst.current_step
+                                            if step and step.action_type == ActionType.DETECT_ONLY:
+                                                # DETECT_ONLY: Advance without physical dispatch
+                                                logger.info(f"[DETECT_ONLY] Target '{expected_target_id}' detected for Region {owner_region}")
+                                                inst.on_action_dispatched()
+                                                inst.advance_step()
+                                                if self.on_state_change:
+                                                    self.on_state_change(owner_region, inst.state.value, inst.current_step_index)
+                                            elif not self.is_dry_run:
                                                 dispatched = self.action_manager.dispatch_action(cand_cx, cand_cy, {})
                                                 if dispatched:
                                                     inst.on_action_dispatched()
                                                     inst.advance_step()
                                                     if self.on_state_change:
                                                         self.on_state_change(owner_region, inst.state.value, inst.current_step_index)
+                                                else:
+                                                    logger.warning(f"Failed to dispatch action for Region {owner_region} - retrying")
+                                                    inst.transition_to(RegionState.WAIT_STEP, reason="Dispatch failed; retrying")
                                             else:
                                                 # Dry-Run mode: Advance without dispatching
                                                 logger.info(f"[DRY-RUN] WOULD_CLICK at ({cand_cx}, {cand_cy}) for Region {owner_region}")

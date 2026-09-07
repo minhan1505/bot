@@ -77,11 +77,27 @@ class RegionInstance:
         self.history.append(entry)
         logger.debug(f"[Region {self.region_id}|Gen {self.generation}] {old_state.value} -> {new_state.value} ({reason})")
 
-    def on_target_detected(self, target_id: str, screen_pos: tuple):
+    def is_in_cooldown(self, now: Optional[float] = None) -> bool:
+        """Checks if region is currently in cooldown from previous action."""
+        if self.last_action_at <= 0.0:
+            return False
+        if now is None:
+            now = time.time()
+        cooldown_ms = 0
+        if self.current_step_index > 0 and self.current_step_index - 1 < len(self.workflow.steps):
+            cooldown_ms = max(cooldown_ms, self.workflow.steps[self.current_step_index - 1].cooldown_ms)
+        if self.current_step:
+            cooldown_ms = max(cooldown_ms, self.current_step.cooldown_ms)
+        elapsed_sec = now - self.last_action_at
+        return elapsed_sec < (cooldown_ms / 1000.0)
+
+    def on_target_detected(self, target_id: str, screen_pos: tuple, now: Optional[float] = None):
         """Triggered when target of current step is detected."""
         if self.state != RegionState.WAIT_STEP:
             return
         if target_id != self.expected_target_id:
+            return
+        if self.is_in_cooldown(now):
             return
         self.detected_target_id = target_id
         self.detected_screen_pos = screen_pos
@@ -94,7 +110,7 @@ class RegionInstance:
 
     def on_action_dispatched(self):
         """Triggered when background action is dispatched."""
-        if self.state == RegionState.VERIFIED:
+        if self.state in (RegionState.VERIFIED, RegionState.TARGET_DETECTED):
             now = time.time()
             self.last_action_at = now
             self.transition_to(RegionState.ACTION_PENDING, reason="Action dispatched")
@@ -113,7 +129,7 @@ class RegionInstance:
     def check_timeout(self, now: float) -> bool:
         """Checks if current step has timed out."""
         step = self.current_step
-        if not step or self.state not in (RegionState.WAIT_STEP, RegionState.TARGET_DETECTED):
+        if not step or self.state not in (RegionState.WAIT_STEP, RegionState.TARGET_DETECTED, RegionState.VERIFIED, RegionState.ACTION_PENDING):
             return False
 
         elapsed_ms = (now - self.state_entered_at) * 1000.0
