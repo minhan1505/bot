@@ -192,6 +192,7 @@ class HardwareSLAAcceptanceHarness:
             confuser_image_paths=[self.confuser_path],
             calibration=self.calib_profile
         )
+        self.calib_profile.target_content_hash = self.target.compute_content_hash()
 
         # Create Profile with 19 Regions
         self.profile = Profile(

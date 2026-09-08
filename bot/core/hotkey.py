@@ -86,9 +86,11 @@ class GlobalHotkeyManager:
         self.is_registered = False
         self.last_error = ""
         self._last_trigger_time = 0.0
+        self._was_started = False
 
     def start(self) -> Tuple[bool, str]:
         """Starts background hotkey message loop thread."""
+        self._was_started = True
         if sys.platform != "win32":
             logger.info("Non-Windows platform: Global hotkey disabled.")
             self.is_registered = False
@@ -111,42 +113,55 @@ class GlobalHotkeyManager:
 
     def update_hotkey(self, hotkey_str: str) -> Tuple[bool, str]:
         """
-        Dynamically updates hotkey (FC-01, U02).
+        Dynamically updates hotkey (FC-01, U02, X03).
         Unregisters previous hotkey, registers new hotkey, and returns status.
-        If registration fails (e.g. HOTKEY_CONFLICT), safely restores the previous hotkey
+        If registration fails (e.g. HOTKEY_CONFLICT), safely restores the previous working hotkey
         binding so emergency stop capability is never lost.
+        If previous hotkey was already unbound/failed, attempts registration and only reports success
+        if registration actually succeeds.
         """
         new_vk, new_mods = parse_hotkey_string(hotkey_str)
         old_str = self.hotkey_str
         old_vk = self.vk_code
         old_mods = self.modifiers
         was_alive = self.is_alive()
+        was_registered = self.is_registered
+        was_started = getattr(self, "_was_started", False)
 
         self.hotkey_str = hotkey_str
         self.vk_code = new_vk
         self.modifiers = new_mods
 
-        if was_alive or self.is_registered:
+        if was_alive or was_registered or was_started:
             success, err = self.start()
             if not success:
-                logger.error(f"HOTKEY_CONFLICT: Failed to register hotkey '{hotkey_str}'. Reverting to '{old_str}'.")
-                # Revert fields to old binding
-                self.hotkey_str = old_str
-                self.vk_code = old_vk
-                self.modifiers = old_mods
-                # Re-activate old hotkey to guarantee fail-safe emergency stop remains online
-                rollback_success, rollback_err = self.start()
-                if not rollback_success:
+                logger.error(f"HOTKEY_CONFLICT: Failed to register hotkey '{hotkey_str}'.")
+                if was_alive or was_registered:
+                    # Revert fields to old binding and attempt rollback
+                    self.hotkey_str = old_str
+                    self.vk_code = old_vk
+                    self.modifiers = old_mods
+                    rollback_success, rollback_err = self.start()
+                    if not rollback_success:
+                        self.is_registered = False
+                        self.last_error = "HOTKEY_ROLLBACK_FAILED"
+                        logger.critical(
+                            f"HOTKEY_UNBOUND: Both new hotkey '{hotkey_str}' and original hotkey '{old_str}' failed registration. "
+                            f"Rollback error: {rollback_err}"
+                        )
+                        return False, "HOTKEY_ROLLBACK_FAILED"
+                    self.last_error = err or "HOTKEY_CONFLICT"
+                    return False, self.last_error
+                else:
+                    # Previous hotkey was already unbound; no rollback possible
                     self.is_registered = False
-                    self.last_error = "HOTKEY_ROLLBACK_FAILED"
-                    logger.critical(
-                        f"HOTKEY_UNBOUND: Both new hotkey '{hotkey_str}' and original hotkey '{old_str}' failed registration. "
-                        f"Rollback error: {rollback_err}"
-                    )
-                    return False, "HOTKEY_ROLLBACK_FAILED"
-                self.last_error = err or "HOTKEY_CONFLICT"
-                return False, self.last_error
+                    self.last_error = err or "HOTKEY_CONFLICT"
+                    return False, self.last_error
+
+            self.is_registered = True
+            self.last_error = ""
             return True, "HOTKEY_REGISTERED"
+
         return True, "HOTKEY_UPDATED"
 
     def is_alive(self) -> bool:

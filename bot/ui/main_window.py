@@ -684,7 +684,7 @@ class MainWindow(QMainWindow):
                 )
                 # Revert combo to current active
                 self.combo_hotkey.blockSignals(True)
-                self.combo_hotkey.setCurrentText(self.active_profile.emergency_hotkey or "F12")
+                self.combo_hotkey.setCurrentText(self.active_profile.emergency_hotkey or "")
                 self.combo_hotkey.blockSignals(False)
             return
 

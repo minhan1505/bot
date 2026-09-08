@@ -490,9 +490,10 @@ class TargetCalibrationDialog(QDialog):
         # Training/Reference Partition: Session A (D_calib) reference images (W03)
         ref_imgs = pos_a_imgs
 
-        # Construct competitor alternative targets dictionary
+        # Construct competitor alternative targets dictionary using D_calib (Session A) negatives ONLY (X02)
+        # Session B negatives (neg_b_imgs) are strictly held out for D_val evaluation and cannot influence threshold calibration
         alt_imgs: Dict[str, np.ndarray] = {}
-        for idx, img in enumerate(neg_a_imgs + neg_b_imgs):
+        for idx, img in enumerate(neg_a_imgs):
             alt_imgs[f"confuser_{idx}"] = img
 
         # Construct genuine, partitioned evaluation samples with verified provenance

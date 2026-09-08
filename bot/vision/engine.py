@@ -267,7 +267,8 @@ class VisionEngine:
                 canonical_size=self.canonical_size,
                 t_g=0.5,
                 t_e=0.65,
-                m_safe=0.05
+                m_safe=0.05,
+                target_content_hash=target.compute_content_hash()
             )
 
         decisions = self.evaluate_candidates(

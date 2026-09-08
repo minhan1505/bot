@@ -63,6 +63,7 @@ def test_bot_runtime_runner_executes_live_cycle(tmp_path):
     )
 
     target = Target(target_id="target_check", name="Check", reference_image_paths=[ref_path], calibration=calib)
+    calib.target_content_hash = target.compute_content_hash()
     reg = RegionModel(region_id="r1", name="Region 1", x=50, y=50, w=200, h=200)
     wf = Workflow(workflow_id="wf1", name="WF", steps=[WorkflowStep(step_index=0, target_id="target_check")])
 

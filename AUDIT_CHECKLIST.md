@@ -488,4 +488,17 @@ The 15 Functional Completion items requested in GitHub comment `5581209834` (PR 
 | **W05** | **P1** | **Path-Independent Content Hashing & Portable Calibrated ZIP:** In `bot/core/models.py`, `Target.compute_content_hash()` computes canonical SHA-256 over image byte hashes and roles (`ref:` vs `conf:`) without absolute file paths. Moving profiles or extracting ZIP bundles across machines preserves exact content hash and calibration validity. | `tests/test_functional_completion.py::test_w05_*` |
 | **W06** | **P1/P2** | **Calibration Compatibility Pre-Check & Controlled SAFE_PAUSE:** In `MainWindow._toggle_bot()`, validates `target.calibration.is_valid_for(...)` against active model SHA and content hash before starting Production mode. In `BotRuntimeRunner.run()`, wrapped `evaluate_candidates()` in `try...except ValueError` catching `CALIBRATION_INVALID`, transitioning the region to `SAFE_PAUSE` with diagnostic fault evidence without killing the worker thread. | `tests/test_functional_completion.py::test_w06_*` |
 
+---
+
+## 19. Re-Audit Hardening Matrix (X01 → X05)
+
+| Finding | Severity | Resolution Details | Test Evidence |
+|---|---|---|---|
+| **X01** | **P0/P1** | **Python 3.12 Calibration Typing & AST Verification:** Added `from __future__ import annotations` and imported `List, Tuple, Dict, Optional, Union, Any` in `bot/vision/calibration.py`. AST verified all `bot/` codebase files to guarantee zero missing typing imports remain. | `tests/test_functional_completion.py::test_x01_*` |
+| **X02** | **P0/P1** | **Strict $D_{val}$ Negative Isolation:** In `bot/ui/calibration_dialog.py`, competitor target bank (`alt_imgs`) is constructed exclusively from Session A negatives (`neg_a_imgs`, $D_{calib}$). Session B negatives (`neg_b_imgs`, $D_{val}$) are strictly held out for evaluation and never participate in $M_{safe}$ threshold calibration. | `tests/test_functional_completion.py::test_x02_*` |
+| **X03** | **P0** | **Emergency Hotkey Re-Registration & Recovery after Rollback Failure:** In `bot/core/hotkey.py`, tracked `_was_started` state in `GlobalHotkeyManager`. `update_hotkey()` attempts registration whenever the manager was started, even if currently unbound/dead after a rollback failure. In `bot/ui/main_window.py`, combo box falls back to empty string when unbound, and choosing a new valid key immediately re-registers and restores normal operation without restarting the app. | `tests/test_functional_completion.py::test_x03_*` |
+| **X04** | **P1** | **Unhashed Calibration Rejection & Migration Invalidation:** In `bot/core/models.py`, `CalibrationProfile.is_valid_for()` returns `False` when caller supplies a `target_content_hash` and the calibration profile lacks a hash (`None`/empty), requiring recalibration. In `bot/core/database.py`, `migrate_profile_data()` actively invalidates legacy unhashed calibrations (`target.calibration = None`). | `tests/test_functional_completion.py::test_x04_*` |
+| **X05** | **P2** | **Deterministic Commit SHA Verification & CI Billing Audit:** Verified exact Git commit SHA via programmatic `git rev-parse HEAD`. Confirmed external GitHub Actions billing lock root cause for workflow annotations. | Programmatic `git rev-parse HEAD` verification |
+
+
 

@@ -230,6 +230,7 @@ def test_tri_condition_authority_rejects_different_symbol_with_same_color():
         m_safe=0.05
     )
     target = Target(target_id="target_check", name="Check Target", calibration=calib)
+    calib.target_content_hash = target.compute_content_hash()
 
     # Frame containing both the true checkmark and the imposter cross
     frame = np.zeros((100, 200, 3), dtype=np.uint8)

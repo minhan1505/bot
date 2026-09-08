@@ -327,6 +327,7 @@ def test_fc06_offline_test_target_runner(tmp_path):
     )
 
     target = Target(target_id="btn", name="Btn", reference_image_paths=[ref_path], calibration=calib)
+    calib.target_content_hash = target.compute_content_hash()
 
     # Frame with target at (80, 80)
     frame = np.zeros((400, 400, 3), dtype=np.uint8)
@@ -393,6 +394,7 @@ def test_fc09_execution_mode_differentiation(tmp_path):
     )
 
     target = Target(target_id="tgt_mode", name="Mode Target", reference_image_paths=[ref_path], calibration=calib)
+    calib.target_content_hash = target.compute_content_hash()
     reg = RegionModel(region_id="r_mode", name="Region Mode", x=50, y=50, w=200, h=200, workflow_id="wf_mode")
     wf = Workflow(workflow_id="wf_mode", name="Mode Workflow", steps=[WorkflowStep(step_index=0, target_id="tgt_mode")])
 
@@ -776,6 +778,7 @@ def test_u05_multi_reference_target_recognition_runtime():
         reference_image_paths=[],
         calibration=calib
     )
+    calib.target_content_hash = target.compute_content_hash()
 
     # Candidate frame containing CROSS (matches Ref 2, but not Ref 1)
     frame = np.zeros((128, 128, 3), dtype=np.uint8)
@@ -1579,5 +1582,223 @@ def test_w06_invalid_calibration_blocks_start_and_caught_in_runner_as_safe_pause
     with pytest.raises(ValueError) as excinfo:
         engine.evaluate_candidates(frame, [cand], t1, [tgt_img], None)
     assert "CALIBRATION_INVALID" in str(excinfo.value)
+
+
+# ==============================================================================
+# X01 -> X05 Regression Tests
+# ==============================================================================
+
+def test_x01_calibration_typing_and_import():
+    """X01 Regression: Python 3.12 typing compatibility and import in bot.vision.calibration."""
+    import bot.vision.calibration as calib_module
+    assert hasattr(calib_module, "calibrate_target_from_samples")
+    assert hasattr(calib_module, "calibrate_target_from_partitions")
+    assert hasattr(calib_module, "CalibrationEngine")
+    assert hasattr(calib_module, "EvaluationSample")
+    assert hasattr(calib_module, "CalibrationOverlapError")
+
+    # AST check: Verify all python files in bot/ parse and compile without typing errors
+    import ast
+    import glob
+    bot_files = glob.glob("bot/**/*.py", recursive=True)
+    assert len(bot_files) > 10
+    for f_path in bot_files:
+        with open(f_path, "r", encoding="utf-8") as f:
+            code = f.read()
+        tree = ast.parse(code, filename=f_path)
+        assert tree is not None
+
+
+def test_x02_dval_negatives_do_not_leak_into_dcalib_thresholds(tmp_path):
+    """X02 Regression: neg_b_imgs from Session B (D_val) must not leak into alt_imgs or influence D_calib thresholds."""
+    from bot.ui.calibration_dialog import TargetCalibrationDialog
+    from bot.vision.onnx_verifier import ONNXVerifier
+    from bot.vision.geometry import GeometryVerifier
+    from bot.vision.calibration import EvaluationSample, calibrate_target_from_partitions as real_calib_part
+    from PySide6.QtWidgets import QApplication
+
+    geo_v = GeometryVerifier((64, 64))
+    onnx_v = ONNXVerifier(MODEL_PATH, canonical_size=(64, 64))
+
+    # Construct distinct images for Session A (D_calib) and Session B (D_val)
+    pos_a = np.zeros((64, 64, 3), dtype=np.uint8)
+    cv2.circle(pos_a, (32, 32), 15, (255, 255, 255), -1)
+
+    neg_a = np.zeros((64, 64, 3), dtype=np.uint8)
+    cv2.rectangle(neg_a, (10, 10), (30, 30), (255, 255, 255), -1)
+
+    pos_b = np.zeros((64, 64, 3), dtype=np.uint8)
+    cv2.circle(pos_b, (32, 32), 17, (240, 240, 240), -1)
+
+    neg_b_1 = np.zeros((64, 64, 3), dtype=np.uint8)
+    cv2.line(neg_b_1, (0, 0), (63, 63), (255, 255, 255), 3)
+
+    neg_b_2 = np.zeros((64, 64, 3), dtype=np.uint8)
+    cv2.line(neg_b_2, (0, 63), (63, 0), (255, 255, 255), 5)
+
+    p_pos_a = str(tmp_path / "x02_pos_a.png")
+    p_neg_a = str(tmp_path / "x02_neg_a.png")
+    p_pos_b = str(tmp_path / "x02_pos_b.png")
+    p_neg_b_1 = str(tmp_path / "x02_neg_b_1.png")
+    p_neg_b_2 = str(tmp_path / "x02_neg_b_2.png")
+
+    cv2.imwrite(p_pos_a, pos_a)
+    cv2.imwrite(p_neg_a, neg_a)
+    cv2.imwrite(p_pos_b, pos_b)
+    cv2.imwrite(p_neg_b_1, neg_b_1)
+    cv2.imwrite(p_neg_b_2, neg_b_2)
+
+    tgt = Target(target_id="tgt_x02", name="Tgt X02", reference_image_paths=[p_pos_a])
+    prof = Profile(profile_id="p_x02", name="Profile X02", targets={"tgt_x02": tgt})
+    app = QApplication.instance() or QApplication([])
+
+    dlg = TargetCalibrationDialog(tgt, prof, onnx_v, geo_v)
+    dlg.session_a_pos = [p_pos_a]
+    dlg.session_a_neg = [p_neg_a]
+    dlg.session_b_pos = [p_pos_b]
+    dlg.session_b_neg = [p_neg_b_1]
+    dlg.txt_session_a.setText("site_20260908_sess_A")
+    dlg.txt_session_b.setText("site_20260908_sess_B")
+    dlg.txt_run_a.setText("run_calib_001")
+    dlg.txt_run_b.setText("run_val_002")
+
+    with patch("bot.vision.calibration.calibrate_target_from_partitions", wraps=real_calib_part) as mock_calib_part:
+        with patch("PySide6.QtWidgets.QMessageBox.information"):
+            dlg._run_calibration()
+
+        assert mock_calib_part.called
+        kwargs = mock_calib_part.call_args[1]
+        alt_imgs = kwargs["alternative_identity_imgs"]
+
+        # X02 Check: alt_imgs MUST ONLY contain neg_a (confuser_0), and NEVER neg_b
+        assert len(alt_imgs) == 1
+        assert "confuser_0" in alt_imgs
+        np.testing.assert_array_equal(alt_imgs["confuser_0"], neg_a)
+        assert "confuser_1" not in alt_imgs
+
+    calib_1 = dlg.calibrated_profile
+    assert calib_1 is not None
+
+    # Run again with completely different Session B negative (neg_b_2)
+    dlg2 = TargetCalibrationDialog(tgt, prof, onnx_v, geo_v)
+    dlg2.session_a_pos = [p_pos_a]
+    dlg2.session_a_neg = [p_neg_a]
+    dlg2.session_b_pos = [p_pos_b]
+    dlg2.session_b_neg = [p_neg_b_2]
+    dlg2.txt_session_a.setText("site_20260908_sess_A")
+    dlg2.txt_session_b.setText("site_20260908_sess_B")
+    dlg2.txt_run_a.setText("run_calib_001")
+    dlg2.txt_run_b.setText("run_val_002")
+
+    with patch("PySide6.QtWidgets.QMessageBox.information"):
+        dlg2._run_calibration()
+
+    calib_2 = dlg2.calibrated_profile
+    assert calib_2 is not None
+
+    # Calibrated thresholds on D_calib must be 100% identical regardless of D_val negatives
+    assert calib_1.t_g == calib_2.t_g
+    assert calib_1.t_e == calib_2.t_e
+    assert calib_1.m_safe == calib_2.m_safe
+
+
+def test_x03_hotkey_recovery_after_rollback_failure():
+    """X03 Regression: Recovering from HOTKEY_ROLLBACK_FAILED without restarting application."""
+    from bot.core.hotkey import GlobalHotkeyManager
+    from bot.ui.main_window import MainWindow
+    from PySide6.QtWidgets import QApplication
+
+    # Unit test on GlobalHotkeyManager
+    mgr = GlobalHotkeyManager(hotkey_str="F12")
+    mgr._was_started = True
+    mgr.is_registered = False
+    mgr.last_error = "HOTKEY_ROLLBACK_FAILED"
+
+    # User selects new valid hotkey F9
+    with patch.object(mgr, "start", return_value=(True, "")) as mock_start:
+        ok, msg = mgr.update_hotkey("F9")
+        assert ok is True
+        assert msg == "HOTKEY_REGISTERED"
+        assert mock_start.called
+        assert mgr.is_registered is True
+        assert mgr.last_error == ""
+        assert mgr.hotkey_str == "F9"
+
+    # UI level test on MainWindow
+    app = QApplication.instance() or QApplication([])
+    win = MainWindow()
+    win.hotkey_manager._was_started = True
+    win.hotkey_manager.is_registered = False
+    win.hotkey_manager.last_error = "HOTKEY_ROLLBACK_FAILED"
+    win.active_profile.emergency_hotkey = ""
+
+    with patch.object(win.hotkey_manager, "start", return_value=(True, "")):
+        win._on_hotkey_changed("F10")
+        assert win.active_profile.emergency_hotkey == "F10"
+        assert win.hotkey_manager.is_registered is True
+        assert win.hotkey_manager.hotkey_str == "F10"
+
+
+def test_x04_legacy_unhashed_calibration_invalidation():
+    """X04 Regression: is_valid_for rejects legacy unhashed calibration when target_content_hash is supplied; migration invalidates it."""
+    # 1. is_valid_for rejection
+    legacy_calib = CalibrationProfile(
+        created_at=time.time(),
+        sample_count=4,
+        separation_gap=0.4,
+        model_name="test_model",
+        model_sha256="sha_abc",
+        precision="FP32",
+        canonical_size=(64, 64),
+        t_g=0.5,
+        t_e=0.6,
+        m_safe=0.05,
+        target_content_hash=None  # Legacy profile lacking hash
+    )
+
+    # When caller supplies a target content hash, missing hash in calibration profile MUST return False
+    assert legacy_calib.is_valid_for("sha_abc", "FP32", (64, 64), target_content_hash="content_hash_123") is False
+
+    # When caller does not supply target content hash, legacy profile is still accepted
+    assert legacy_calib.is_valid_for("sha_abc", "FP32", (64, 64), target_content_hash=None) is True
+
+    # When calibration profile has a matching target content hash, it returns True
+    modern_calib = legacy_calib.model_copy(update={"target_content_hash": "content_hash_123"})
+    assert modern_calib.is_valid_for("sha_abc", "FP32", (64, 64), target_content_hash="content_hash_123") is True
+
+    # 2. Database migration invalidates legacy unhashed calibration
+    legacy_data = {
+        "schema_version": 1,
+        "profile_id": "p_legacy_calib",
+        "name": "Legacy Calib Profile",
+        "regions": {},
+        "workflows": {},
+        "targets": {
+            "t1": {
+                "target_id": "t1",
+                "name": "Target 1",
+                "reference_image_paths": [],
+                "confuser_image_paths": [],
+                "calibration": {
+                    "created_at": time.time(),
+                    "sample_count": 4,
+                    "separation_gap": 0.4,
+                    "model_name": "test",
+                    "model_sha256": "sha_abc",
+                    "precision": "FP32",
+                    "canonical_size": [64, 64],
+                    "t_g": 0.5,
+                    "t_e": 0.6,
+                    "m_safe": 0.05,
+                    "target_content_hash": None
+                }
+            }
+        }
+    }
+
+    migrated_prof, was_migrated = migrate_profile_data(legacy_data)
+    assert was_migrated is True
+    assert migrated_prof.targets["t1"].calibration is None
+
 
 

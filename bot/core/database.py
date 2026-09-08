@@ -42,8 +42,27 @@ def migrate_profile_data(data: Dict[str, Any]) -> Tuple[Profile, bool]:
                         t_data["reference_image_paths"] = []
                     if "confuser_image_paths" not in t_data:
                         t_data["confuser_image_paths"] = []
+                    # Invalidate legacy unhashed calibration (X04)
+                    calib = t_data.get("calibration")
+                    if isinstance(calib, dict) and not calib.get("target_content_hash"):
+                        logger.warning(
+                            f"Invalidating legacy unhashed calibration for target '{t_id}' in profile '{data.get('name')}'"
+                        )
+                        t_data["calibration"] = None
 
         logger.info(f"Migrated profile '{data.get('name')}' from schema v{current_version} to v{SCHEMA_VERSION}")
+
+    # Also invalidate unhashed calibration for targets even if schema_version matches (X04)
+    elif "targets" in data and isinstance(data["targets"], dict):
+        for t_id, t_data in data["targets"].items():
+            if isinstance(t_data, dict):
+                calib = t_data.get("calibration")
+                if isinstance(calib, dict) and not calib.get("target_content_hash"):
+                    logger.warning(
+                        f"Invalidating legacy unhashed calibration for target '{t_id}' in profile '{data.get('name')}'"
+                    )
+                    t_data["calibration"] = None
+                    migrated = True
 
     profile = Profile.model_validate(data)
     return profile, migrated

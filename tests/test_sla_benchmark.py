@@ -70,6 +70,7 @@ def test_hard_sla_supported_workload_19_regions():
         m_safe=0.05
     )
     target = Target(target_id="target_check", name="Check Target", calibration=calib)
+    calib.target_content_hash = target.compute_content_hash()
 
     # 3. Setup 19 Regions in Grid
     wf = Workflow(workflow_id="wf1", name="WF", steps=[WorkflowStep(step_index=0, target_id="target_check")])

@@ -60,7 +60,9 @@ class CalibrationProfile(BaseModel):
         )
         if not base_valid:
             return False
-        if self.target_content_hash is not None and target_content_hash is not None:
+        if target_content_hash is not None:
+            if not self.target_content_hash:
+                return False
             return self.target_content_hash == target_content_hash
         return True
 

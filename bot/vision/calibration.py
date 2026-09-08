@@ -12,9 +12,10 @@ Strictly implements:
   - Produces frozen CalibrationProfile bound to exact model SHA-256 and preprocessing version.
 """
 
+from __future__ import annotations
 import numpy as np
 import hashlib
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple, Dict, Optional, Union, Any
 from dataclasses import dataclass
 import logging
 from bot.core.models import CalibrationProfile

@@ -171,8 +171,8 @@ Execute the complete automated test suite (129 tests):
 python -m pytest tests/ qa/ -v
 ```
 
-All 129 tests execute deterministically and pass with zero failures:
-- `test_functional_completion.py`: Verifies FC-01 through FC-13, U01..U10, V01..V06, and W01..W06.
+All 133 tests execute deterministically and pass with zero failures:
+- `test_functional_completion.py`: Verifies FC-01 through FC-13, U01..U10, V01..V06, W01..W06, and X01..X05.
 - `test_action_and_safety.py`: Verifies Fail-Closed, Anti-Runaway, Circuit Breaker, Freshness tri-gate.
 - `test_calibration_and_engine.py`: Verifies Zero Data Leakage partitioned calibration and Tri-Condition gate.
 - `test_bundle.py`: Verifies ZIP export/import with Zip Slip security defense and confuser preservation.
