@@ -334,6 +334,7 @@ class BotRuntimeRunner:
                                         "desktop_offset": desktop_offset,
                                         "viewport_context": getattr(backend, "viewport_context", None),
                                         "is_production": self.is_production,
+                                        "verify_freshness": self.is_production,
                                     }
 
                                     step = inst.current_step

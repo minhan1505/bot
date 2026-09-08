@@ -161,7 +161,9 @@ class CDPActionBackend(BaseActionBackend):
                         const dpr = window.devicePixelRatio || 1.0;
                         const w = window.innerWidth;
                         const h = window.innerHeight;
-                        return { dpr: dpr, innerWidth: w, innerHeight: h };
+                        const sx = window.screenX !== undefined ? window.screenX : window.screenLeft;
+                        const sy = window.screenY !== undefined ? window.screenY : window.screenTop;
+                        return { dpr: dpr, innerWidth: w, innerHeight: h, screenX: sx, screenY: sy };
                     })()
                     """
                     msg = {"id": 9001, "method": "Runtime.evaluate", "params": {"expression": script, "returnByValue": True}}
@@ -178,6 +180,8 @@ class CDPActionBackend(BaseActionBackend):
             curr_dpr = float(current.get("dpr", 1.0))
             curr_w = int(current.get("innerWidth", 0))
             curr_h = int(current.get("innerHeight", 0))
+            curr_sx = int(round(float(current.get("screenX", 0)) * curr_dpr))
+            curr_sy = int(round(float(current.get("screenY", 0)) * curr_dpr))
 
             if abs(curr_dpr - target_ctx.device_pixel_ratio) > 1e-4:
                 reason = f"DPR_DRIFT: recorded={target_ctx.device_pixel_ratio}, current={curr_dpr}"
@@ -186,6 +190,11 @@ class CDPActionBackend(BaseActionBackend):
 
             if int(round(target_ctx.inner_width)) != curr_w or int(round(target_ctx.inner_height)) != curr_h:
                 reason = f"VIEWPORT_RESIZED: recorded={int(round(target_ctx.inner_width))}x{int(round(target_ctx.inner_height))}, current={curr_w}x{curr_h}"
+                self.invalidate_surface_context(reason)
+                return False, reason
+
+            if target_ctx.window_rect.x != curr_sx or target_ctx.window_rect.y != curr_sy:
+                reason = f"WINDOW_MOVED: recorded=({target_ctx.window_rect.x}, {target_ctx.window_rect.y}), current=({curr_sx}, {curr_sy})"
                 self.invalidate_surface_context(reason)
                 return False, reason
 

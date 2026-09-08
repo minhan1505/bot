@@ -373,6 +373,10 @@ def test_target_calibration_dialog_rejects_content_leakage_between_sessions(tmp_
     dlg.session_b_pos = [file_b]
     dlg.session_a_neg = [confuser_a]
     dlg.session_b_neg = [confuser_b]
+    dlg.txt_session_a.setText("siteA_session")
+    dlg.txt_session_b.setText("siteB_session")
+    dlg.txt_run_a.setText("runA_01")
+    dlg.txt_run_b.setText("runB_02")
 
     with patch("PySide6.QtWidgets.QMessageBox.critical") as mock_crit:
         dlg._run_calibration()
@@ -386,17 +390,24 @@ def test_calibrate_target_from_samples_rejects_identical_samples():
     from bot.vision.calibration import calibrate_target_from_samples, CalibrationOverlapError
 
     img = np.zeros((48, 48, 3), dtype=np.uint8)
-    # 2 identical positive images
-    pos_samples = [img, img.copy()]
-    neg_samples = [np.ones((48, 48, 3), dtype=np.uint8) * 50, np.ones((48, 48, 3), dtype=np.uint8) * 100]
+    pos_calib = [img]
+    pos_val = [img.copy()]
+    neg_calib = [np.ones((48, 48, 3), dtype=np.uint8) * 50]
+    neg_val = [np.ones((48, 48, 3), dtype=np.uint8) * 100]
 
     with pytest.raises(CalibrationOverlapError) as exc_info:
         calibrate_target_from_samples(
             target_id="t_dup",
             target_reference_img=img,
-            positive_images=pos_samples,
-            negative_images=neg_samples,
-            alternative_identity_imgs={"alt1": neg_samples[0]},
+            pos_calib=pos_calib,
+            neg_calib=neg_calib,
+            pos_val=pos_val,
+            neg_val=neg_val,
+            session_calib="siteA_session",
+            session_val="siteB_session",
+            run_calib="runA",
+            run_val="runB",
+            alternative_identity_imgs={"alt1": neg_calib[0]},
             geo_verifier=MagicMock(),
             onnx_verifier=MagicMock()
         )
@@ -443,7 +454,8 @@ def test_surface_dialog_cdp_probe_constructs_valid_viewport_context():
                     "received": True,
                     "targetTagName": "CANVAS",
                     "eventTargetMatched": True,
-                    "rafActive": True
+                    "rafActive": True,
+                    "hoverActive": True
                 }
             }
         }
@@ -628,26 +640,78 @@ def test_target_calibration_dialog_rejects_overlapping_provenance_ids(tmp_path):
     # Force identical session IDs
     dlg.txt_session_a.setText("SAME_SESSION")
     dlg.txt_session_b.setText("SAME_SESSION")
+    dlg.txt_run_a.setText("runA")
+    dlg.txt_run_b.setText("runB")
 
-    with patch("PySide6.QtWidgets.QMessageBox.critical") as mock_crit:
+    with patch("PySide6.QtWidgets.QMessageBox.critical") as mock_crit, \
+         patch("PySide6.QtWidgets.QMessageBox.warning") as mock_warn:
         dlg._run_calibration()
         mock_crit.assert_called_once()
         assert "Session IDs must be distinct" in mock_crit.call_args[0][2]
 
     # Distinct sessions, but identical run IDs
-    dlg.txt_session_a.setText("session_1")
-    dlg.txt_session_b.setText("session_2")
+    dlg.txt_session_a.setText("siteA_session")
+    dlg.txt_session_b.setText("siteB_session")
     dlg.txt_run_a.setText("SAME_RUN")
     dlg.txt_run_b.setText("SAME_RUN")
 
-    with patch("PySide6.QtWidgets.QMessageBox.critical") as mock_crit:
+    with patch("PySide6.QtWidgets.QMessageBox.critical") as mock_crit, \
+         patch("PySide6.QtWidgets.QMessageBox.warning") as mock_warn:
         dlg._run_calibration()
         mock_crit.assert_called_once()
         assert "Run IDs must be distinct" in mock_crit.call_args[0][2]
 
 
+def test_target_calibration_dialog_rejects_empty_and_dummy_provenance(tmp_path):
+    """Verifies TargetCalibrationDialog rejects empty session/run IDs or generic placeholders."""
+    import cv2
+    import numpy as np
+    from bot.ui.calibration_dialog import TargetCalibrationDialog
+
+    file_a = str(tmp_path / "img_pos_a.png")
+    file_b = str(tmp_path / "img_pos_b.png")
+    conf_a = str(tmp_path / "conf_a.png")
+    conf_b = str(tmp_path / "conf_b.png")
+    cv2.imwrite(file_a, np.zeros((48, 48, 3), dtype=np.uint8))
+    cv2.imwrite(file_b, np.ones((48, 48, 3), dtype=np.uint8) * 10)
+    cv2.imwrite(conf_a, np.ones((48, 48, 3), dtype=np.uint8) * 50)
+    cv2.imwrite(conf_b, np.ones((48, 48, 3), dtype=np.uint8) * 80)
+
+    target = Target(target_id="t_empty_prov", name="Target Empty Prov")
+    profile = Profile(profile_id="p_test", name="Profile")
+
+    dlg = TargetCalibrationDialog(target, profile, MagicMock(), MagicMock())
+    dlg.session_a_pos = [file_a]
+    dlg.session_b_pos = [file_b]
+    dlg.session_a_neg = [conf_a]
+    dlg.session_b_neg = [conf_b]
+
+    # Empty Session ID
+    dlg.txt_session_a.setText("")
+    dlg.txt_session_b.setText("siteB_session")
+    dlg.txt_run_a.setText("runA")
+    dlg.txt_run_b.setText("runB")
+
+    with patch("PySide6.QtWidgets.QMessageBox.warning") as mock_warn, \
+         patch("PySide6.QtWidgets.QMessageBox.critical") as mock_crit:
+        dlg._run_calibration()
+        mock_warn.assert_called_once()
+        assert "Explicit, non-empty Session IDs are required" in mock_warn.call_args[0][2]
+
+    # Generic dummy placeholder "session_a"
+    dlg.txt_session_a.setText("session_a")
+    dlg.txt_session_b.setText("session_b")
+    dlg.txt_run_a.setText("runA")
+    dlg.txt_run_b.setText("runB")
+    with patch("PySide6.QtWidgets.QMessageBox.warning") as mock_warn, \
+         patch("PySide6.QtWidgets.QMessageBox.critical") as mock_crit:
+        dlg._run_calibration()
+        mock_warn.assert_called_once()
+        assert "Generic dummy session labels" in mock_warn.call_args[0][2]
+
+
 def test_cdp_backend_freshness_check_invalidates_on_geometry_drift():
-    """Verifies verify_viewport_freshness detects DPR drift and window resize, invalidating context."""
+    """Verifies verify_viewport_freshness detects DPR drift, window resize, and window movement, invalidating context."""
     from bot.action.cdp_backend import CDPActionBackend
     from bot.core.coordinates import ViewportContext, Rect
     import json
@@ -664,10 +728,12 @@ def test_cdp_backend_freshness_check_invalidates_on_geometry_drift():
     backend.viewport_context = ctx
 
     class MockWs:
-        def __init__(self, dpr, w, h):
+        def __init__(self, dpr, w, h, sx=0, sy=0):
             self.dpr = dpr
             self.w = w
             self.h = h
+            self.sx = sx
+            self.sy = sy
         async def __aenter__(self):
             return self
         async def __aexit__(self, *args):
@@ -677,19 +743,20 @@ def test_cdp_backend_freshness_check_invalidates_on_geometry_drift():
         async def recv(self):
             return json.dumps({
                 "result": {"result": {"value": {
-                    "dpr": self.dpr, "innerWidth": self.w, "innerHeight": self.h
+                    "dpr": self.dpr, "innerWidth": self.w, "innerHeight": self.h,
+                    "screenX": self.sx, "screenY": self.sy
                 }}}
             })
 
     # 1. Fresh case
-    with patch("bot.action.cdp_backend.websockets.connect", return_value=MockWs(1.0, 1920, 1080)):
+    with patch("bot.action.cdp_backend.websockets.connect", return_value=MockWs(1.0, 1920, 1080, 0, 0)):
         fresh, msg = backend.verify_viewport_freshness(ctx)
         assert fresh is True
         assert msg == "FRESH"
         assert backend.viewport_context is not None
 
     # 2. Resized case
-    with patch("bot.action.cdp_backend.websockets.connect", return_value=MockWs(1.0, 1280, 720)):
+    with patch("bot.action.cdp_backend.websockets.connect", return_value=MockWs(1.0, 1280, 720, 0, 0)):
         fresh, msg = backend.verify_viewport_freshness(ctx)
         assert fresh is False
         assert "VIEWPORT_RESIZED" in msg
@@ -697,11 +764,42 @@ def test_cdp_backend_freshness_check_invalidates_on_geometry_drift():
 
     # 3. DPR drift case
     backend.viewport_context = ctx
-    with patch("bot.action.cdp_backend.websockets.connect", return_value=MockWs(1.5, 1920, 1080)):
+    with patch("bot.action.cdp_backend.websockets.connect", return_value=MockWs(1.5, 1920, 1080, 0, 0)):
         fresh, msg = backend.verify_viewport_freshness(ctx)
         assert fresh is False
         assert "DPR_DRIFT" in msg
         assert backend.viewport_context is None # Invalidated!
+
+    # 4. Window moved case (dragged across monitor without resize)
+    backend.viewport_context = ctx
+    with patch("bot.action.cdp_backend.websockets.connect", return_value=MockWs(1.0, 1920, 1080, 300, 150)):
+        fresh, msg = backend.verify_viewport_freshness(ctx)
+        assert fresh is False
+        assert "WINDOW_MOVED" in msg
+        assert backend.viewport_context is None # Invalidated on move!
+
+
+def test_action_manager_checks_freshness_in_production():
+    """Verifies ActionManager in production mode verifies freshness and rejects stale geometry."""
+    from bot.action.cdp_backend import CDPActionBackend
+    from bot.core.coordinates import ViewportContext, Rect
+
+    backend = CDPActionBackend()
+    ctx = ViewportContext(window_rect=Rect(0, 0, 100, 100), client_rect=Rect(0, 0, 100, 100))
+    backend.viewport_context = ctx
+
+    action_mgr = ActionManager()
+    action_mgr.backend = backend
+    action_mgr.is_supported = True
+    action_mgr.is_surface_verified = True
+    action_mgr.viewport_context = ctx
+
+    # Mock verify_viewport_freshness reporting drift
+    with patch.object(backend, "verify_viewport_freshness", return_value=(False, "WINDOW_MOVED: recorded=(0, 0), current=(200, 100)")):
+        res = action_mgr.dispatch_action(50, 50, context={"is_production": True, "verify_freshness": True})
+        assert res.status == ActionDispatchStatus.FAIL_CLOSED
+        assert "GEOMETRY_FRESHNESS_FAILED" in res.reason
+        assert action_mgr.is_surface_verified is False # Binding dropped!
 
 
 def test_action_manager_invalidate_binding():

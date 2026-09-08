@@ -133,8 +133,12 @@ class ActionManager:
             logger.error("Action dispatch rejected: SURFACE_UNVERIFIED_ACTION_BLOCKED. Protocol ACK is not surface verification.")
             return ActionDispatchResult(ActionDispatchStatus.FAIL_CLOSED, "SURFACE_UNVERIFIED_ACTION_BLOCKED", target_screen_pt=(screen_x, screen_y))
 
-        # Check geometry freshness if requested or if backend supports it
-        if context.get("verify_freshness", False) and hasattr(self.backend, "verify_viewport_freshness"):
+        # Check geometry freshness if requested or in production mode
+        should_check_freshness = (
+            context.get("verify_freshness", False) or
+            context.get("is_production", False)
+        )
+        if should_check_freshness and hasattr(self.backend, "verify_viewport_freshness") and self.viewport_context:
             fresh, fresh_err = self.backend.verify_viewport_freshness(self.viewport_context)
             if not fresh:
                 self.invalidate_binding(fresh_err)

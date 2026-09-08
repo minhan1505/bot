@@ -408,8 +408,8 @@ class SurfaceVerificationDialog(QDialog):
                     has_ctx = bool(reaction.get("hasCanvasContext", False))
                     target_tag = reaction.get("targetTagName", "")
 
-                    # Strict tri-condition gate: received AND matched (no overlay interception) AND rafActive (active render loop)
-                    probe_ok = bool(received and matched and raf_ok)
+                    # Strict quad-condition gate: received AND matched (no overlay interception) AND rafActive (active render loop) AND hoverActive (CSS engine reaction)
+                    probe_ok = bool(received and matched and raf_ok and hover_ok)
                     diag = f"Target Surface <{target_tag}>: received={received}, matched={matched}, rafActive={raf_ok}, hoverActive={hover_ok}, canvasCtx={has_ctx}"
                     return info, probe_ok, diag
 

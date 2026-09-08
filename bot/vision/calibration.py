@@ -251,38 +251,58 @@ class CalibrationEngine:
 def calibrate_target_from_samples(
     target_id: str,
     target_reference_img: np.ndarray,
-    positive_images: List[np.ndarray],
-    negative_images: List[np.ndarray],
+    pos_calib: List[np.ndarray],
+    neg_calib: List[np.ndarray],
+    pos_val: List[np.ndarray],
+    neg_val: List[np.ndarray],
+    session_calib: str,
+    session_val: str,
+    run_calib: str,
+    run_val: str,
     alternative_identity_imgs: Optional[Dict[str, np.ndarray]],
     geo_verifier: GeometryVerifier,
     onnx_verifier: ONNXVerifier,
+    device_calib: str = "dev_calib",
+    device_val: str = "dev_val",
     canonical_size: Tuple[int, int] = (64, 64)
 ) -> CalibrationProfile:
     """
-    High-level convenience orchestrator that prepares session-partitioned D_calib and D_val
-    and executes CalibrationEngine.calibrate_target.
-    Enforces disjoint session IDs to prevent data leakage.
+    Executes calibration on explicitly partitioned sample sets provided by the caller,
+    carrying verified group-wise provenance metadata (session_id, device_id, run_id).
+    Strictly forbids splitting a single unpartitioned image list or synthesizing artificial session tags.
     """
-    if len(positive_images) < 2:
-        raise ValueError("At least 2 positive samples (Session A and Session B) are required for calibration and validation.")
-    if len(negative_images) < 2:
-        raise ValueError("At least 2 negative/confuser samples are required for calibration and validation.")
+    if not pos_calib or not pos_val:
+        raise ValueError("Both calibration and validation partitions must contain at least 1 real positive sample.")
+    if not neg_calib or not neg_val:
+        raise ValueError("Both calibration and validation partitions must contain at least 1 confuser/negative sample.")
     if not alternative_identity_imgs:
         raise CalibrationOverlapError(
             f"CALIBRATION_BLOCKED_MISSING_CONFUSERS: Target '{target_id}' has no competitor targets or confusers configured."
         )
 
-    # Split positive samples into Session A (calib) and Session B (val)
-    mid_pos = max(1, len(positive_images) // 2)
-    pos_calib = positive_images[:mid_pos]
-    pos_val = positive_images[mid_pos:]
+    # Validate provenance non-empty and disjoint
+    s_calib = session_calib.strip()
+    s_val = session_val.strip()
+    r_calib = run_calib.strip()
+    r_val = run_val.strip()
 
-    # Split negative samples into Session A (calib) and Session B (val)
-    mid_neg = max(1, len(negative_images) // 2)
-    neg_calib = negative_images[:mid_neg]
-    neg_val = negative_images[mid_neg:]
+    if not s_calib or not s_val:
+        raise ValueError("PROVENANCE_METADATA_REQUIRED: Non-empty session_calib and session_val must be provided.")
+    if not r_calib or not r_val:
+        raise ValueError("PROVENANCE_METADATA_REQUIRED: Non-empty run_calib and run_val must be provided.")
 
-    # Enforce zero content leakage between Session A and Session B partitions
+    if s_calib.lower() == s_val.lower():
+        raise CalibrationOverlapError(
+            f"DATA_LEAKAGE_DETECTED: Calibration and validation partitions share the same session ID ('{s_calib}'). "
+            "Samples must originate from distinct physical capture sessions."
+        )
+    if r_calib.lower() == r_val.lower():
+        raise CalibrationOverlapError(
+            f"DATA_LEAKAGE_DETECTED: Calibration and validation partitions share the same capture run ID ('{r_calib}'). "
+            "Samples must originate from distinct capture runs."
+        )
+
+    # Enforce zero content leakage between calibration and validation partitions
     calib_hashes = {hashlib.sha256(img.tobytes()).hexdigest() for img in pos_calib}
     for img in pos_val:
         if hashlib.sha256(img.tobytes()).hexdigest() in calib_hashes:
@@ -298,19 +318,27 @@ def calibrate_target_from_samples(
                 "DATA_LEAKAGE_DETECTED: Confuser validation partition contains samples identical to calibration partition."
             )
 
+    # Check contradiction between positive and negative samples
+    all_pos_hashes = calib_hashes.union({hashlib.sha256(img.tobytes()).hexdigest() for img in pos_val})
+    for img in neg_calib + neg_val:
+        if hashlib.sha256(img.tobytes()).hexdigest() in all_pos_hashes:
+            raise CalibrationOverlapError(
+                "DATA_CONTRADICTION_DETECTED: A negative confuser sample has identical pixel content to a positive target sample."
+            )
+
     d_calib = [
-        EvaluationSample(image=img, is_positive=True, label=target_id, session_id="session_A", device_id="dev_0", run_id="run_A")
+        EvaluationSample(image=img, is_positive=True, label=target_id, session_id=s_calib, device_id=device_calib, run_id=r_calib)
         for img in pos_calib
     ] + [
-        EvaluationSample(image=img, is_positive=False, label="negative", session_id="session_A", device_id="dev_0", run_id="run_A")
+        EvaluationSample(image=img, is_positive=False, label="negative", session_id=s_calib, device_id=device_calib, run_id=r_calib)
         for img in neg_calib
     ]
 
     d_val = [
-        EvaluationSample(image=img, is_positive=True, label=target_id, session_id="session_B", device_id="dev_1", run_id="run_B")
+        EvaluationSample(image=img, is_positive=True, label=target_id, session_id=s_val, device_id=device_val, run_id=r_val)
         for img in pos_val
     ] + [
-        EvaluationSample(image=img, is_positive=False, label="negative", session_id="session_B", device_id="dev_1", run_id="run_B")
+        EvaluationSample(image=img, is_positive=False, label="negative", session_id=s_val, device_id=device_val, run_id=r_val)
         for img in neg_val
     ]
 

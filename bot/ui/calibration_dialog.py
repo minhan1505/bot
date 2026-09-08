@@ -159,9 +159,12 @@ class TargetCalibrationDialog(QDialog):
         # Provenance Metadata
         grp_prov = QGroupBox(f"Capture Provenance Metadata (Session {session_key})")
         prov_layout = QFormLayout(grp_prov)
-        txt_session = QLineEdit(f"session_{session_key}")
-        txt_device = QLineEdit("dev_0" if session_key == "A" else "dev_1")
-        txt_run = QLineEdit(f"run_{session_key}")
+        txt_session = QLineEdit()
+        txt_session.setPlaceholderText(f"e.g. 2026-09-08_site_{session_key.lower()}")
+        txt_device = QLineEdit()
+        txt_device.setPlaceholderText(f"e.g. rig_{'primary' if session_key == 'A' else 'secondary'}")
+        txt_run = QLineEdit()
+        txt_run.setPlaceholderText(f"e.g. capture_run_{session_key.lower()}_01")
         setattr(self, f"txt_session_{session_key.lower()}", txt_session)
         setattr(self, f"txt_device_{session_key.lower()}", txt_device)
         setattr(self, f"txt_run_{session_key.lower()}", txt_run)
@@ -421,14 +424,32 @@ class TargetCalibrationDialog(QDialog):
         txt_r_a = getattr(self, "txt_run_a", None)
         txt_r_b = getattr(self, "txt_run_b", None)
 
-        session_a_id = (txt_sess_a.text().strip() if txt_sess_a else "") or "session_A"
-        session_b_id = (txt_sess_b.text().strip() if txt_sess_b else "") or "session_B"
-        device_a_id = (txt_dev_a.text().strip() if txt_dev_a else "") or "dev_0"
-        device_b_id = (txt_dev_b.text().strip() if txt_dev_b else "") or "dev_1"
-        run_a_id = (txt_r_a.text().strip() if txt_r_a else "") or "run_A"
-        run_b_id = (txt_r_b.text().strip() if txt_r_b else "") or "run_B"
+        session_a_id = txt_sess_a.text().strip() if txt_sess_a else ""
+        session_b_id = txt_sess_b.text().strip() if txt_sess_b else ""
+        device_a_id = txt_dev_a.text().strip() if txt_dev_a else ""
+        device_b_id = txt_dev_b.text().strip() if txt_dev_b else ""
+        run_a_id = txt_r_a.text().strip() if txt_r_a else ""
+        run_b_id = txt_r_b.text().strip() if txt_r_b else ""
 
-        if session_a_id == session_b_id:
+        if not session_a_id or not session_b_id:
+            QMessageBox.warning(
+                self,
+                "PROVENANCE_REQUIRED",
+                "Explicit, non-empty Session IDs are required for both Session A and Session B.\n"
+                "Please enter verified capture session identifiers."
+            )
+            return
+
+        if not run_a_id or not run_b_id:
+            QMessageBox.warning(
+                self,
+                "PROVENANCE_REQUIRED",
+                "Explicit, non-empty Capture Run IDs are required for both Session A and Session B.\n"
+                "Please enter verified capture run identifiers."
+            )
+            return
+
+        if session_a_id.lower() == session_b_id.lower():
             QMessageBox.critical(
                 self,
                 "DATA_LEAKAGE_DETECTED",
@@ -437,12 +458,31 @@ class TargetCalibrationDialog(QDialog):
             )
             return
 
-        if run_a_id and run_b_id and run_a_id == run_b_id:
+        if run_a_id.lower() == run_b_id.lower():
             QMessageBox.critical(
                 self,
                 "DATA_LEAKAGE_DETECTED",
                 f"Data leakage detected: Run IDs must be distinct across calibration and validation partitions.\n"
                 f"Run A: '{run_a_id}', Run B: '{run_b_id}'"
+            )
+            return
+
+        # Check for generic dummy labels that evade true provenance
+        generic_dummies = {"session_a", "session_b", "run_a", "run_b", "session1", "session2", "run1", "run2"}
+        if session_a_id.lower() in generic_dummies or session_b_id.lower() in generic_dummies:
+            QMessageBox.warning(
+                self,
+                "GENERIC_PLACEHOLDER_REJECTED",
+                "Generic dummy session labels ('session_a', 'session_b', etc.) are rejected.\n"
+                "Please provide meaningful capture session provenance from your acquisition records."
+            )
+            return
+        if run_a_id.lower() in generic_dummies or run_b_id.lower() in generic_dummies:
+            QMessageBox.warning(
+                self,
+                "GENERIC_PLACEHOLDER_REJECTED",
+                "Generic dummy run labels ('run_a', 'run_b', etc.) are rejected.\n"
+                "Please provide meaningful capture run provenance from your acquisition records."
             )
             return
 

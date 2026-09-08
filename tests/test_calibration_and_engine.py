@@ -131,13 +131,19 @@ def test_calibrate_target_from_samples_rejects_confuser_leakage():
     pos_2 = make_glyph_image("PLUS")
     shared_confuser = make_glyph_image("CROSS")
 
-    # Confusers are identical across calib and val partitions: [shared_confuser, shared_confuser]
+    # Confusers are identical across calib and val partitions: [shared_confuser] and [shared_confuser]
     with pytest.raises(CalibrationOverlapError) as exc_info:
         calibrate_target_from_samples(
             target_id="target_1",
             target_reference_img=pos_1,
-            positive_images=[pos_1, pos_2],
-            negative_images=[shared_confuser, shared_confuser],
+            pos_calib=[pos_1],
+            neg_calib=[shared_confuser],
+            pos_val=[pos_2],
+            neg_val=[shared_confuser],
+            session_calib="siteA_session",
+            session_val="siteB_session",
+            run_calib="runA_01",
+            run_val="runB_02",
             alternative_identity_imgs={"confuser": shared_confuser},
             geo_verifier=geo_verifier,
             onnx_verifier=onnx_verifier
@@ -145,6 +151,58 @@ def test_calibrate_target_from_samples_rejects_confuser_leakage():
 
     assert "DATA_LEAKAGE_DETECTED" in str(exc_info.value)
     assert "Confuser validation partition" in str(exc_info.value)
+
+
+def test_calibrate_target_from_samples_rejects_identical_session_or_run():
+    from bot.vision.calibration import calibrate_target_from_samples
+
+    geo_verifier = GeometryVerifier(canonical_size=(64, 64))
+    onnx_verifier = ONNXVerifier(model_path=MODEL_PATH, canonical_size=(64, 64))
+
+    pos_1 = make_glyph_image("CHECK")
+    pos_2 = make_glyph_image("PLUS")
+    confuser_1 = make_glyph_image("CROSS")
+    confuser_2 = make_glyph_image("SQUARE")
+
+    # Identical session IDs
+    with pytest.raises(CalibrationOverlapError) as exc_info:
+        calibrate_target_from_samples(
+            target_id="target_1",
+            target_reference_img=pos_1,
+            pos_calib=[pos_1],
+            neg_calib=[confuser_1],
+            pos_val=[pos_2],
+            neg_val=[confuser_2],
+            session_calib="same_session",
+            session_val="same_session",
+            run_calib="runA",
+            run_val="runB",
+            alternative_identity_imgs={"confuser": confuser_1},
+            geo_verifier=geo_verifier,
+            onnx_verifier=onnx_verifier
+        )
+    assert "DATA_LEAKAGE_DETECTED" in str(exc_info.value)
+    assert "session ID" in str(exc_info.value)
+
+    # Identical run IDs
+    with pytest.raises(CalibrationOverlapError) as exc_info:
+        calibrate_target_from_samples(
+            target_id="target_1",
+            target_reference_img=pos_1,
+            pos_calib=[pos_1],
+            neg_calib=[confuser_1],
+            pos_val=[pos_2],
+            neg_val=[confuser_2],
+            session_calib="session_1",
+            session_val="session_2",
+            run_calib="same_run",
+            run_val="same_run",
+            alternative_identity_imgs={"confuser": confuser_1},
+            geo_verifier=geo_verifier,
+            onnx_verifier=onnx_verifier
+        )
+    assert "DATA_LEAKAGE_DETECTED" in str(exc_info.value)
+    assert "capture run ID" in str(exc_info.value)
 
 
 
