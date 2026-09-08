@@ -941,3 +941,328 @@ def test_u08_bundle_import_safe_geometry_re_resolution(tmp_path):
         assert reg.x + reg.w <= 1920
         assert reg.y + reg.h <= 1080
         assert reg.x >= 0 and reg.y >= 0
+
+
+def test_v01_multi_reference_fresh_verify_with_multiple_regions_and_targets(tmp_path):
+    """
+    V01: Fresh verify must evaluate across all references of the current target,
+    must NOT leak leftover loop variables from prior regions,
+    and must normalize competitor targets as List[np.ndarray] (prevent nested lists).
+    """
+    import cv2
+    import numpy as np
+    from bot.core.coordinates import Rect
+    from bot.vision.proposal import CandidateProposal
+    from bot.action.base import ActionDispatchResult, ActionDispatchStatus
+
+    # Create real distinct glyph images (FC-06 / U05)
+    img1_a = make_glyph_image("CIRCLE", bg_color=(200, 50, 50))
+    img1_b = make_glyph_image("CIRCLE", bg_color=(180, 60, 60))
+    img2_a = make_glyph_image("CROSS", bg_color=(50, 200, 50))
+    img2_b = make_glyph_image("CROSS", bg_color=(60, 180, 60))
+
+    p1_a = str(tmp_path / "t1_a.png")
+    p1_b = str(tmp_path / "t1_b.png")
+    p2_a = str(tmp_path / "t2_a.png")
+    p2_b = str(tmp_path / "t2_b.png")
+
+    cv2.imwrite(p1_a, img1_a)
+    cv2.imwrite(p1_b, img1_b)
+    cv2.imwrite(p2_a, img2_a)
+    cv2.imwrite(p2_b, img2_b)
+
+    onnx_v = ONNXVerifier(model_path=MODEL_PATH)
+    geo_v = GeometryVerifier(canonical_size=(64, 64))
+
+    t1 = Target(
+        target_id="t1",
+        name="Target 1",
+        reference_image_paths=[p1_a, p1_b],
+        calibration=CalibrationProfile(
+            created_at=time.time(),
+            sample_count=2,
+            separation_gap=0.2,
+            model_name="test",
+            model_sha256=onnx_v.model_sha256,
+            precision=onnx_v.precision,
+            canonical_size=(64, 64),
+            t_g=0.5,
+            t_e=0.6,
+            m_safe=0.01,
+            target_content_hash=""
+        )
+    )
+    t1.calibration.target_content_hash = t1.compute_content_hash()
+
+    t2 = Target(
+        target_id="t2",
+        name="Target 2",
+        reference_image_paths=[p2_a, p2_b],
+        calibration=CalibrationProfile(
+            created_at=time.time(),
+            sample_count=2,
+            separation_gap=0.2,
+            model_name="test",
+            model_sha256=onnx_v.model_sha256,
+            precision=onnx_v.precision,
+            canonical_size=(64, 64),
+            t_g=0.5,
+            t_e=0.6,
+            m_safe=0.01,
+            target_content_hash=""
+        )
+    )
+    t2.calibration.target_content_hash = t2.compute_content_hash()
+
+    r1 = RegionModel(region_id="r1", name="Region 1", x=10, y=10, w=80, h=80, workflow_id="wf1")
+    r2 = RegionModel(region_id="r2", name="Region 2", x=100, y=100, w=80, h=80, workflow_id="wf2")
+
+    wf1 = Workflow(workflow_id="wf1", name="WF1", steps=[WorkflowStep(step_index=0, target_id="t1", action_type=ActionType.CLICK)])
+    wf2 = Workflow(workflow_id="wf2", name="WF2", steps=[WorkflowStep(step_index=0, target_id="t2", action_type=ActionType.CLICK)])
+
+    profile = Profile(
+        profile_id="p_v01",
+        name="V01 Profile",
+        targets={"t1": t1, "t2": t2},
+        regions={"r1": r1, "r2": r2},
+        workflows={"wf1": wf1, "wf2": wf2},
+        scan_interval_ms=10
+    )
+
+    frame = np.zeros((300, 300, 3), dtype=np.uint8)
+    frame[20:20+48, 20:20+48] = img1_a
+
+    mock_cap = MagicMock()
+    mock_cap.grab.return_value = (frame, time.time())
+    mock_cap.grab_sub_roi.return_value = (img1_a, time.time())
+
+    mock_backend = MockWorkingBackend()
+    action_mgr = ActionManager(backend=mock_backend)
+    action_mgr.probe_and_bind(mock_backend, {"surface_verified": True})
+
+    prop_engine = CandidateProposalEngine(k_base_per_region=4, max_batch_limit=128)
+    vis_engine = VisionEngine(onnx_verifier=onnx_v, geometry_verifier=geo_v, proposal_engine=prop_engine)
+
+    ledger = SessionLedger()
+    inst1 = ledger.register_region(r1, wf1)
+    inst2 = ledger.register_region(r2, wf2)
+    inst1.start_workflow()
+    inst2.start_workflow()
+
+    runner = BotRuntimeRunner(
+        profile=profile,
+        capture_manager=mock_cap,
+        vision_engine=vis_engine,
+        action_manager=action_mgr,
+        ledger=ledger,
+        is_production=True
+    )
+
+    def mock_gen_props(crop, r_rect, ref_img, r_id):
+        if r_id == "r1":
+            return [CandidateProposal(rect=Rect(20, 20, 48, 48), region_id="r1", strategy="contour", score=0.95)]
+        return []
+
+    with patch.object(prop_engine, "generate_proposals_for_region", side_effect=mock_gen_props):
+        runner.start()
+        time.sleep(0.3)
+        runner.stop()
+
+    assert runner.total_matches >= 1
+
+
+def test_v02_global_truncation_emits_performance_fault_even_when_regions_under_kbase():
+    """
+    V02: When total candidates exceed max_batch_limit but every individual region has
+    candidates <= k_base, global truncation MUST flag PROPOSAL_OVERFLOW_GLOBAL_TRUNCATION
+    on the truncated regions rather than leaving them NORMAL_OK.
+    """
+    from bot.core.coordinates import Rect
+    from bot.vision.proposal import CandidateProposal
+
+    engine = CandidateProposalEngine(k_base_per_region=4, max_batch_limit=10)
+
+    # 4 regions, each having 3 proposals (3 <= 4, so no single region overflows K_base)
+    # Total proposals = 12 > max_batch_limit (10)
+    proposals_by_region = {
+        f"r{i}": [
+            CandidateProposal(rect=Rect(i * 10, j * 10, 10, 10), region_id=f"r{i}", score=float(10 - (i * 3 + j)))
+            for j in range(3)
+        ]
+        for i in range(4)
+    }
+
+    final_props, diags = engine.apply_same_frame_escalation(proposals_by_region)
+
+    # Total must be capped to max_batch_limit (10)
+    assert len(final_props) == 10
+
+    # Region r3 had lowest score proposals, so 2 of its proposals were globally truncated!
+    # V02 Invariant: r3 MUST be flagged with PROPOSAL_OVERFLOW, not NORMAL_OK!
+    assert "PROPOSAL_OVERFLOW" in diags["r3"]
+    assert "PROPOSAL_OVERFLOW_GLOBAL_TRUNCATION" in diags["r3"]
+
+
+def test_v03_profile_snapshot_restore_uses_activate_profile_and_hotkey_rollback_sync():
+    """
+    V03: Profile snapshot restore must call activate_profile() to update runtime managers,
+    and hotkey rollback must synchronize profile.emergency_hotkey to the actually bound hotkey.
+    """
+    from bot.core.database import Database
+    import tempfile
+
+    db_file = tempfile.mktemp(suffix=".db")
+    db = Database(db_file)
+
+    p1 = Profile(profile_id="p1", name="Profile 1", monitor_index=1, emergency_hotkey="F8")
+    db.save_profile(p1)
+    snap_id = db.create_snapshot("p1", label="Backup 1")
+
+    # Now modify p1
+    p1.monitor_index = 2
+    p1.emergency_hotkey = "F9"
+    db.save_profile(p1)
+
+    from PySide6.QtWidgets import QApplication
+    from bot.ui.main_window import MainWindow
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow(db_path=db_file)
+
+    # Mock QInputDialog.getItem to select snap_id and mock QMessageBox to avoid modal block
+    with patch("PySide6.QtWidgets.QMessageBox.information"), \
+         patch("PySide6.QtWidgets.QInputDialog.getItem", return_value=(f"{snap_id} — Backup 1", True)):
+        with patch.object(window, "activate_profile", wraps=window.activate_profile) as spy_activate:
+            window._restore_profile_snapshot()
+            assert spy_activate.called
+            restored_arg = spy_activate.call_args[0][0]
+            assert restored_arg.monitor_index == 1
+            assert restored_arg.emergency_hotkey == "F8"
+
+    # Test hotkey conflict synchronization in activate_profile:
+    conflict_profile = Profile(profile_id="p_conf", name="Conflict Prof", emergency_hotkey="Ctrl+Alt+Del")
+    with patch.object(window.hotkey_manager, "update_hotkey", return_value=(False, "HOTKEY_CONFLICT")):
+        window.hotkey_manager.hotkey_str = "F12"
+        success, _ = window.activate_profile(conflict_profile)
+        assert success is True
+        # V03 Invariant: On conflict rollback, profile.emergency_hotkey synchronizes to registered hotkey
+        assert conflict_profile.emergency_hotkey == "F12"
+
+
+def test_v04_double_click_safety_quota_precheck_boundary():
+    """
+    V04: DOUBLE_CLICK must pre-check total/per-region/rate quotas with planned_cost=2.
+    If quota=1, dispatch must fail closed BEFORE sending any clicks.
+    Also, UNCERTAIN outcomes must be conservatively accounted in quotas.
+    """
+    from bot.action.base import ActionDispatchResult, ActionDispatchStatus
+
+    backend = MockWorkingBackend()
+    safety = SafetyConfig(max_total_clicks=1, max_clicks_per_region=1, max_clicks_per_second=5.0)
+    manager = ActionManager(backend=backend, safety_config=safety)
+    manager.probe_and_bind(backend, {"surface_verified": True})
+
+    # Total click quota boundary: current=0, limit=1, DOUBLE_CLICK needs 2
+    res = manager.dispatch_action(100, 100, {"action_type": ActionType.DOUBLE_CLICK, "is_production": False})
+    assert res.status == ActionDispatchStatus.FAIL_CLOSED
+    assert "Total click quota exceeded" in res.reason
+    assert manager.total_clicks == 0
+    assert len(backend.dispatched_clicks) == 0
+
+    # Per-region quota boundary: limit=1, current=0, DOUBLE_CLICK needs 2
+    safety2 = SafetyConfig(max_total_clicks=10, max_clicks_per_region=1, max_clicks_per_second=10.0)
+    manager2 = ActionManager(backend=backend, safety_config=safety2)
+    manager2.probe_and_bind(backend, {"surface_verified": True})
+
+    res2 = manager2.dispatch_action(100, 100, {"action_type": ActionType.DOUBLE_CLICK, "region_id": "r_test"})
+    assert res2.status == ActionDispatchStatus.FAIL_CLOSED
+    assert "Region click quota exceeded" in res2.reason
+    assert manager2.total_clicks == 0
+
+    # Rate quota boundary: limit=1.0 cps, DOUBLE_CLICK needs 2
+    safety3 = SafetyConfig(max_total_clicks=10, max_clicks_per_region=10, max_clicks_per_second=1.0)
+    manager3 = ActionManager(backend=backend, safety_config=safety3)
+    manager3.probe_and_bind(backend, {"surface_verified": True})
+
+    res3 = manager3.dispatch_action(100, 100, {"action_type": ActionType.DOUBLE_CLICK})
+    assert res3.status == ActionDispatchStatus.FAIL_CLOSED
+    assert "Anti-Runaway rate limit exceeded" in res3.reason
+    assert manager3.total_clicks == 0
+
+    # Conservative UNCERTAIN accounting
+    class MockUncertainBackend:
+        is_supported = True
+        def probe_capability(self, ctx): return True, "OK"
+        def probe(self): return True
+        def dispatch_click(self, x, y, ctx):
+            return ActionDispatchResult(ActionDispatchStatus.UNCERTAIN, "Timeout waiting for OS acknowledgment")
+
+    unc_mgr = ActionManager(backend=MockUncertainBackend(), safety_config=SafetyConfig(max_total_clicks=5))
+    unc_mgr.probe_and_bind(MockUncertainBackend(), {"surface_verified": True})
+
+    u_res = unc_mgr.dispatch_action(100, 100, {"action_type": ActionType.CLICK, "region_id": "reg_u"})
+    assert u_res.status == ActionDispatchStatus.UNCERTAIN
+    assert unc_mgr.total_clicks == 1
+    assert unc_mgr._region_clicks["reg_u"] == 1
+
+
+def test_v05_calibration_dialog_cancel_does_not_mutate_original_target():
+    """
+    V05: TargetCalibrationDialog must operate on a deep copy and commit to the original
+    target ONLY on Accept. If Cancel/Reject is pressed, original target remains untouched.
+    """
+    from bot.ui.calibration_dialog import TargetCalibrationDialog
+    from PySide6.QtWidgets import QApplication
+
+    target = Target(
+        target_id="t_calib",
+        name="Target for Calib",
+        reference_image_paths=["ref_original.png"],
+        confuser_image_paths=["conf_original.png"],
+        calibration=None
+    )
+    profile = Profile(profile_id="p_test", name="Profile Test", targets={"t_calib": target})
+
+    onnx_v = MagicMock()
+    geo_v = MagicMock()
+
+    app = QApplication.instance() or QApplication([])
+    dlg = TargetCalibrationDialog(target, profile, onnx_v, geo_v)
+
+    mock_calib = CalibrationProfile(
+        created_at=time.time(),
+        sample_count=2,
+        separation_gap=0.5,
+        model_name="test",
+        model_sha256="test",
+        t_g=0.5,
+        t_e=0.6,
+        m_safe=0.05,
+        target_content_hash="mock_hash"
+    )
+    dlg.calibrated_profile = mock_calib
+    dlg.target.reference_image_paths = ["new_ref1.png", "new_ref2.png"]
+    dlg.target.confuser_image_paths = ["new_conf.png"]
+    dlg.target.calibration = mock_calib
+
+    # User clicks Cancel (reject)
+    dlg.reject()
+
+    # V05 Invariant: Original target must be completely unmodified!
+    assert target.calibration is None
+    assert target.reference_image_paths == ["ref_original.png"]
+    assert target.confuser_image_paths == ["conf_original.png"]
+
+    # Now simulate User clicking Accept
+    dlg2 = TargetCalibrationDialog(target, profile, onnx_v, geo_v)
+    dlg2.calibrated_profile = mock_calib
+    dlg2.target.reference_image_paths = ["new_ref1.png", "new_ref2.png"]
+    dlg2.target.confuser_image_paths = ["new_conf.png"]
+    dlg2.target.calibration = mock_calib
+
+    dlg2.accept()
+
+    # V05 Invariant: Original target is committed on Accept
+    assert target.calibration == mock_calib
+    assert target.reference_image_paths == ["new_ref1.png", "new_ref2.png"]
+    assert target.confuser_image_paths == ["new_conf.png"]
+

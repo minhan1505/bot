@@ -79,7 +79,7 @@ class MainWindow(QMainWindow):
         # Vision Subsystem
         self.geo_verifier = GeometryVerifier(canonical_size=(64, 64))
         self.onnx_verifier = ONNXVerifier(model_path=MODEL_PATH, canonical_size=(64, 64))
-        self.proposal_engine = CandidateProposalEngine(k_base_per_region=4, max_batch_limit=32)
+        self.proposal_engine = CandidateProposalEngine(k_base_per_region=4, max_batch_limit=128)
         self.vision_engine = VisionEngine(self.onnx_verifier, self.geo_verifier, self.proposal_engine)
 
         self.ledger = SessionLedger()
@@ -638,9 +638,7 @@ class MainWindow(QMainWindow):
             snap_id = item.split(" — ")[0]
             restored = self.db.restore_snapshot(snap_id)
             if restored:
-                self.vision_engine.clear_target_cache()
-                self.active_profile = restored
-                self._refresh_profile_views()
+                self.activate_profile(restored)
                 QMessageBox.information(self, "Snapshot Restored", f"Profile successfully restored from snapshot:\n{snap_id}")
             else:
                 QMessageBox.critical(self, "Restore Failed", "Failed to restore snapshot.")
@@ -786,7 +784,12 @@ class MainWindow(QMainWindow):
         if hasattr(self, "hotkey_manager"):
             hk_ok, hk_msg = self.hotkey_manager.update_hotkey(hk_str)
             if not hk_ok:
-                logger.warning(f"Emergency hotkey '{hk_str}' failed to register ({hk_msg}). Rolled back to previous working hotkey.")
+                logger.warning(
+                    f"Emergency hotkey '{hk_str}' failed to register ({hk_msg}). "
+                    f"Rolled back to '{self.hotkey_manager.hotkey_str}'."
+                )
+                # Synchronize profile and UI to the actually registered hotkey (V03)
+                profile.emergency_hotkey = self.hotkey_manager.hotkey_str
 
         # 4. Apply Safety Config to ActionManager
         if hasattr(self, "action_manager") and profile.safety_config:

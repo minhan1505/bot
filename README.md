@@ -125,12 +125,12 @@ D:\xampp\bot\
 │       ├── target_dialog.py                 # Target Details Dialog (Multi-Reference & Confusers)
 │       ├── test_target_dialog.py            # "Test Target" Offline Verification Dialog
 │       └── main_window.py                   # PySide6 Desktop GUI Dashboard
-└── tests/                                   # Complete Automated Test Suite (110 Tests)
+└── tests/                                   # Complete Automated Test Suite (123 Tests)
     ├── test_action_and_safety.py
     ├── test_bundle.py
     ├── test_calibration_and_engine.py
     ├── test_coordinates.py
-    ├── test_functional_completion.py        # FC-01 through FC-13 comprehensive test suite
+    ├── test_functional_completion.py        # FC-01..FC-13, U01..U08, V01..V05 test suite
     ├── test_geometry.py
     ├── test_hardware_sla_harness.py
     ├── test_model_empirical_validation.py
@@ -166,13 +166,13 @@ D:\xampp\bot\
 
 ## Running the Automated Test Suite
 
-Execute the complete automated test suite (110 tests):
+Execute the complete automated test suite (123 tests):
 ```powershell
 python -m pytest tests/ qa/ -v
 ```
 
-All 110 tests execute deterministically and pass with zero failures:
-- `test_functional_completion.py`: Verifies FC-01 through FC-13.
+All 123 tests execute deterministically and pass with zero failures:
+- `test_functional_completion.py`: Verifies FC-01 through FC-13, U01 through U08, and V01 through V05.
 - `test_action_and_safety.py`: Verifies Fail-Closed, Anti-Runaway, Circuit Breaker, Freshness tri-gate.
 - `test_calibration_and_engine.py`: Verifies Zero Data Leakage partitioned calibration and Tri-Condition gate.
 - `test_bundle.py`: Verifies ZIP export/import with Zip Slip security defense and confuser preservation.

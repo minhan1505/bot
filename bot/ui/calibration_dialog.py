@@ -63,7 +63,8 @@ class TargetCalibrationDialog(QDialog):
         parent=None
     ):
         super().__init__(parent)
-        self.target = target
+        self.original_target = target
+        self.target = target.model_copy(deep=True)
         self.profile = profile
         self.onnx_verifier = onnx_verifier
         self.geo_verifier = geo_verifier
@@ -556,3 +557,15 @@ class TargetCalibrationDialog(QDialog):
                 f"Empirical calibration failed safety acceptance criteria:\n{exc}\n"
                 "Target distributions overlap or produce false positives. Add more distinct samples or adjust confusers."
             )
+
+    def accept(self):
+        """
+        Commits staged calibration changes from deep-copy to original target (V05).
+        If the dialog is cancelled or rejected, original target remains completely untouched.
+        """
+        if self.calibrated_profile is not None:
+            self.original_target.reference_image_paths = list(self.target.reference_image_paths)
+            self.original_target.confuser_image_paths = list(self.target.confuser_image_paths)
+            self.original_target.calibration = self.target.calibration
+        super().accept()
+

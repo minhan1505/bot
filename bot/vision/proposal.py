@@ -248,7 +248,19 @@ class CandidateProposalEngine:
 
         # Global safety truncation if still exceeds batch limit
         if len(final_list) > self.max_batch_limit:
-            final_list = sorted(final_list, key=lambda p: p.score, reverse=True)[:self.max_batch_limit]
+            sorted_all = sorted(final_list, key=lambda p: p.score, reverse=True)
+            kept_props = sorted_all[:self.max_batch_limit]
+            dropped_props = sorted_all[self.max_batch_limit:]
+
+            dropped_by_region: Dict[str, int] = {}
+            for dp in dropped_props:
+                dropped_by_region[dp.region_id] = dropped_by_region.get(dp.region_id, 0) + 1
+
+            for r_id, drop_count in dropped_by_region.items():
+                prior_diag = diagnostics.get(r_id, "NORMAL_OK")
+                diagnostics[r_id] = f"PROPOSAL_OVERFLOW_GLOBAL_TRUNCATION(dropped={drop_count}, prior={prior_diag})"
+
+            final_list = kept_props
 
         return final_list, diagnostics
 

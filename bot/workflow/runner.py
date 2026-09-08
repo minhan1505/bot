@@ -177,9 +177,9 @@ class BotRuntimeRunner:
 
                 region_crop = frame[ry1:ry2, rx1:rx2]
                 props = []
-                for ref_img in ref_imgs:
+                for p_ref_img in ref_imgs:
                     sub_p = self.vision_engine.proposal_engine.generate_proposals_for_region(
-                        region_crop, r_rect, ref_img, r_id
+                        region_crop, r_rect, p_ref_img, r_id
                     )
                     props.extend(sub_p)
                 if len(ref_imgs) > 1:
@@ -339,7 +339,7 @@ class BotRuntimeRunner:
                                     g_fresh = 0.0
                                     geo_fresh_pass = False
                                     if hasattr(self.vision_engine, "geo_verifier") and self.vision_engine.geo_verifier is not None:
-                                        g_fresh = self.vision_engine.geo_verifier.compute_geometry_score(fresh_crop, ref_img)
+                                        g_fresh = max(self.vision_engine.geo_verifier.compute_geometry_score(fresh_crop, r) for r in ref_imgs) if ref_imgs else 0.0
                                         geo_fresh_pass = (g_fresh >= t_g)
 
                                     emb_fresh_pass = True if not self.is_production else False
@@ -347,29 +347,34 @@ class BotRuntimeRunner:
 
                                     if hasattr(self.vision_engine, "onnx_verifier") and self.vision_engine.onnx_verifier is not None:
                                         fresh_emb = self.vision_engine.onnx_verifier.compute_embeddings([fresh_crop])[0]
-                                        target_emb = self.vision_engine.onnx_verifier.get_cached_target_embedding(expected_target_id, [ref_img])
+                                        target_emb = self.vision_engine.onnx_verifier.get_cached_target_embedding(expected_target_id, ref_imgs)
                                         if target_emb is None:
-                                            self.vision_engine.onnx_verifier.cache_target_embedding(expected_target_id, [ref_img])
-                                            target_emb = self.vision_engine.onnx_verifier.get_cached_target_embedding(expected_target_id, [ref_img])
+                                            self.vision_engine.onnx_verifier.cache_target_embedding(expected_target_id, ref_imgs)
+                                            target_emb = self.vision_engine.onnx_verifier.get_cached_target_embedding(expected_target_id, ref_imgs)
                                         e_fresh = self.vision_engine.onnx_verifier.cosine_similarity(fresh_emb, target_emb) if target_emb is not None else 0.0
                                         emb_fresh_pass = (e_fresh >= t_e)
 
-                                        # Collect competitor targets including explicit confusers
-                                        fresh_competitors = dict(alt_targets) if alt_targets else {}
+                                        # Collect competitor targets including explicit confusers (normalized to Dict[str, List[np.ndarray]])
+                                        fresh_competitors: Dict[str, List[np.ndarray]] = {}
+                                        if alt_targets:
+                                            for aid, aimgs in alt_targets.items():
+                                                if aimgs:
+                                                    fresh_competitors[aid] = list(aimgs)
                                         if target_cfg.confuser_image_paths:
                                             for c_idx, c_path in enumerate(target_cfg.confuser_image_paths):
-                                                if os.path.exists(c_path):
-                                                    c_img = cv2.imread(c_path)
-                                                    if c_img is not None:
-                                                        fresh_competitors[f"{expected_target_id}_confuser_{c_idx}"] = c_img
+                                                c_img = cv2.imread(c_path)
+                                                if c_img is not None:
+                                                    fresh_competitors[f"{expected_target_id}_confuser_{c_idx}"] = [c_img]
 
                                         if fresh_competitors:
                                             competitor_scores = []
-                                            for aid, aimg in fresh_competitors.items():
-                                                c_emb = self.vision_engine.onnx_verifier.get_cached_target_embedding(aid, [aimg])
+                                            for aid, aimgs in fresh_competitors.items():
+                                                if not aimgs:
+                                                    continue
+                                                c_emb = self.vision_engine.onnx_verifier.get_cached_target_embedding(aid, aimgs)
                                                 if c_emb is None:
-                                                    self.vision_engine.onnx_verifier.cache_target_embedding(aid, [aimg])
-                                                    c_emb = self.vision_engine.onnx_verifier.get_cached_target_embedding(aid, [aimg])
+                                                    self.vision_engine.onnx_verifier.cache_target_embedding(aid, aimgs)
+                                                    c_emb = self.vision_engine.onnx_verifier.get_cached_target_embedding(aid, aimgs)
                                                 if c_emb is not None:
                                                     sim = self.vision_engine.onnx_verifier.cosine_similarity(fresh_emb, c_emb)
                                                     competitor_scores.append(sim)

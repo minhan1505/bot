@@ -140,7 +140,7 @@ class HardwareSLAAcceptanceHarness:
         # Vision Subsystem
         self.geo_verifier = GeometryVerifier(canonical_size=(64, 64))
         self.onnx_verifier = ONNXVerifier(model_path=MODEL_PATH, canonical_size=(64, 64))
-        self.proposal_engine = CandidateProposalEngine(k_base_per_region=4, max_batch_limit=32)
+        self.proposal_engine = CandidateProposalEngine(k_base_per_region=4, max_batch_limit=128)
         self.vision_engine = VisionEngine(self.onnx_verifier, self.geo_verifier, self.proposal_engine)
 
         # Action Backend & Safety Manager

@@ -416,7 +416,7 @@ Output includes the comprehensive markdown benchmark report verifying 0 samples 
 
 ## 14. Functional Completion Matrix (FC-01 → FC-15)
 
-The 15 Functional Completion items requested in GitHub comment `5581209834` (PR #1) have been implemented and verified via automated test suites in `tests/test_functional_completion.py` and the existing test suites (110 total tests passing).
+The 15 Functional Completion items requested in GitHub comment `5581209834` (PR #1) have been implemented and verified via automated test suites in `tests/test_functional_completion.py` and the existing test suites (123 total tests passing).
 
 ### Summary Table
 
@@ -435,7 +435,7 @@ The 15 Functional Completion items requested in GitHub comment `5581209834` (PR 
 | **FC-11** | **Live Metrics & Evidence Logging** | `MainWindow` & `BotRuntimeRunner`: Live counter badges for `MATCH`, `UNKNOWN`, `NON_MATCH`, `REJECT`, `TOTAL`. Rolling latency buffer computes P50, P95, P99, and Max latency. `_save_evidence_crop_async()` logs candidate crops to disk asynchronously on UNKNOWN or low-margin evaluations without blocking runner cycles. | `tests/test_functional_completion.py::test_fc11_*` | ✅ **IMPLEMENTED & TESTED** |
 | **FC-12** | **Bundle Completeness** | `ProfileBundleManager` in `bot/core/bundle.py`: Exports and imports targets with both reference images and confusers. Enforces Zip Slip path traversal security defense. Revalidates imported coordinates and ROIs against current screen geometry. | `tests/test_functional_completion.py::test_fc12_*` | ✅ **IMPLEMENTED & TESTED** |
 | **FC-13** | **Configuration Versioning & Migration** | `SCHEMA_VERSION = 2` in `bot/core/models.py`: `migrate_profile_data()` in `bot/core/database.py` seamlessly upgrades legacy schema v1 JSON profiles to Schema v2 (adding `schema_version=2`, `emergency_hotkey="F12"`, `auto_stop_minutes=0.0`) with zero data loss. | `tests/test_functional_completion.py::test_fc13_*` | ✅ **IMPLEMENTED & TESTED** |
-| **FC-14** | **Test Wiring & Verification** | Comprehensive test suite `tests/test_functional_completion.py` (14 automated tests) integrated into the full test suite (110 passed). Every UI control maps to verified runtime behavior. | `tests/` and `qa/` (110 passed) | ✅ **IMPLEMENTED & TESTED** |
+| **FC-14** | **Test Wiring & Verification** | Comprehensive test suite `tests/test_functional_completion.py` (27 automated tests) integrated into the full test suite (123 passed). Every UI control maps to verified runtime behavior. | `tests/` and `qa/` (123 passed) | ✅ **IMPLEMENTED & TESTED** |
 | **FC-15** | **Documentation & Audit Status Integrity** | Purged all obsolete claims (licensing, HWID, HMAC, machine locking). Maintained strict PARTIAL tracking for F07 and F08. Documented direct execution via `python -m bot`. | `README.md`, `AUDIT_CHECKLIST.md` | ✅ **IMPLEMENTED & TESTED** |
 
 ---
@@ -461,3 +461,17 @@ The 15 Functional Completion items requested in GitHub comment `5581209834` (PR 
   python -m bot
   ```
 - **No .exe Build:** No binary compilation or `.exe` packaging is required or performed.
+
+---
+
+## 17. Re-Audit Hardening Matrix (V01 → V06)
+
+| Finding | Severity | Resolution Details | Test Evidence |
+|---|---|---|---|
+| **V01** | **P0** | **Multi-Reference Fresh-Verify & Normalization:** Fixed reference scope leak in `bot/workflow/runner.py`. Fresh verify evaluates geometry and embedding across all references of the target being verified. Competitor targets and confusers are strictly normalized to `Dict[str, List[np.ndarray]]` to eliminate nested-list crash paths. | `tests/test_functional_completion.py::test_v01_*` |
+| **V02** | **P1** | **Proposal Batch Limit 128 & Global Truncation Fault Evidence:** Wired `max_batch_limit=128` across `MainWindow`, `hardware_sla_harness.py`, and proposal engine default. In `bot/vision/proposal.py`, global truncation records dropped candidate counts per region (`PROPOSAL_OVERFLOW_GLOBAL_TRUNCATION`), ensuring non-matching truncated regions emit `PROPOSAL_OVERFLOW_PERFORMANCE_FAULT` (`UNKNOWN`). | `tests/test_functional_completion.py::test_v02_*` |
+| **V03** | **P1** | **Universal Atomic Profile Activation & Hotkey Rollback Truth:** In `bot/ui/main_window.py`, `_restore_profile_snapshot()` routes through `activate_profile()`. When a requested hotkey conflicts, rollback synchronizes `profile.emergency_hotkey = self.hotkey_manager.hotkey_str` so UI views always display the actually bound emergency key. | `tests/test_functional_completion.py::test_v03_*` |
+| **V04** | **P1** | **DOUBLE_CLICK Pre-Dispatch Safety Quota Boundary:** In `bot/action/manager.py`, computes planned action cost (`CLICK=1`, `DOUBLE_CLICK=2`, `DETECT_ONLY=0`) before dispatch. If `current + planned_cost > limit` for total, per-region, or rate window, fails closed before dispatch. Conservatively records 1 click on `UNCERTAIN` outcomes. | `tests/test_functional_completion.py::test_v04_*` |
+| **V05** | **P1** | **Calibration Wizard Deep-Copy Staging & Safe Cancel:** In `bot/ui/calibration_dialog.py`, `TargetCalibrationDialog` operates on a deep copy (`target.model_copy(deep=True)`). Modifications are staged and only committed to the live target upon `Accept`. Clicking `Cancel` or `reject()` leaves the original target completely untouched. | `tests/test_functional_completion.py::test_v05_*` |
+| **V06** | **P2** | **Documentation & Test Suite Synchronization:** Synchronized test counts across `README.md`, `AUDIT_CHECKLIST.md`, and PR #1 body to exact current suite (123 tests passing). Verified runtime proposal wiring to 128. | `tests/test_functional_completion.py` |
+

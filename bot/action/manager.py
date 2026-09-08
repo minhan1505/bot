@@ -148,38 +148,56 @@ class ActionManager:
                     target_screen_pt=(screen_x, screen_y)
                 )
 
-        # Total click quota check
-        if self._total_clicks >= self.safety_config.max_total_clicks:
-            logger.critical(f"Total click quota exceeded ({self._total_clicks} >= {self.safety_config.max_total_clicks}). Halting.")
-            self._circuit_breaker_tripped = True
-            return ActionDispatchResult(ActionDispatchStatus.FAIL_CLOSED, "Total click quota exceeded", target_screen_pt=(screen_x, screen_y))
-
-        # Per-region click quota check
-        region_id = context.get("region_id")
-        if region_id:
-            reg_clicks = self._region_clicks.get(region_id, 0)
-            if reg_clicks >= self.safety_config.max_clicks_per_region:
-                logger.warning(f"Region '{region_id}' click quota exceeded ({reg_clicks} >= {self.safety_config.max_clicks_per_region}). Dropping action.")
-                return ActionDispatchResult(ActionDispatchStatus.FAIL_CLOSED, f"Region click quota exceeded for '{region_id}'", target_screen_pt=(screen_x, screen_y))
-
-        now = time.time()
-
-        # Anti-runaway rate limiting: 1-second window
-        clicks_1s = [t for t in self._recent_click_timestamps if now - t < 1.0]
-        if len(clicks_1s) >= self.max_clicks_per_sec:
-            logger.warning(f"Anti-Runaway triggered: Rate limit exceeded ({len(clicks_1s)} >= {self.max_clicks_per_sec}/sec). Dropping action.")
-            return ActionDispatchResult(ActionDispatchStatus.FAIL_CLOSED, "Anti-Runaway rate limit exceeded", target_screen_pt=(screen_x, screen_y))
-
-        # Prune circuit breaker window
-        cb_window = self.safety_config.circuit_breaker_window_sec
-        self._recent_click_timestamps = [t for t in self._recent_click_timestamps if now - t < cb_window]
-
         action_type = context.get("action_type", "CLICK")
         if hasattr(action_type, "value"):
             action_type = action_type.value
 
         if action_type == "DETECT_ONLY":
+            planned_cost = 0
+        elif action_type == "DOUBLE_CLICK":
+            planned_cost = 2
+        elif action_type == "CLICK":
+            planned_cost = 1
+        else:
+            logger.error(f"UNSUPPORTED_ACTION_TYPE: Action type '{action_type}' is not supported. Failing closed.")
+            return ActionDispatchResult(ActionDispatchStatus.FAIL_CLOSED, f"Unsupported action type: {action_type}", target_screen_pt=(screen_x, screen_y))
+
+        if action_type == "DETECT_ONLY":
             return ActionDispatchResult(ActionDispatchStatus.DISPATCHED, "DETECT_ONLY (0 click)", target_screen_pt=(screen_x, screen_y))
+
+        # Total click quota check (V04: boundary pre-check with planned action cost)
+        if self._total_clicks + planned_cost > self.safety_config.max_total_clicks:
+            logger.critical(f"Total click quota exceeded ({self._total_clicks} + {planned_cost} > {self.safety_config.max_total_clicks}). Halting.")
+            self._circuit_breaker_tripped = True
+            return ActionDispatchResult(
+                ActionDispatchStatus.FAIL_CLOSED,
+                f"Total click quota exceeded ({self._total_clicks} + {planned_cost} > {self.safety_config.max_total_clicks})",
+                target_screen_pt=(screen_x, screen_y)
+            )
+
+        # Per-region click quota check (V04: boundary pre-check with planned action cost)
+        region_id = context.get("region_id")
+        if region_id:
+            reg_clicks = self._region_clicks.get(region_id, 0)
+            if reg_clicks + planned_cost > self.safety_config.max_clicks_per_region:
+                logger.warning(f"Region '{region_id}' click quota exceeded ({reg_clicks} + {planned_cost} > {self.safety_config.max_clicks_per_region}). Dropping action.")
+                return ActionDispatchResult(
+                    ActionDispatchStatus.FAIL_CLOSED,
+                    f"Region click quota exceeded for '{region_id}' ({reg_clicks} + {planned_cost} > {self.safety_config.max_clicks_per_region})",
+                    target_screen_pt=(screen_x, screen_y)
+                )
+
+        now = time.time()
+
+        # Anti-runaway rate limiting: 1-second window (V04: includes planned action cost)
+        clicks_1s = [t for t in self._recent_click_timestamps if now - t < 1.0]
+        if len(clicks_1s) + planned_cost > self.max_clicks_per_sec:
+            logger.warning(f"Anti-Runaway triggered: Rate limit exceeded ({len(clicks_1s)} + {planned_cost} > {self.max_clicks_per_sec}/sec). Dropping action.")
+            return ActionDispatchResult(ActionDispatchStatus.FAIL_CLOSED, "Anti-Runaway rate limit exceeded", target_screen_pt=(screen_x, screen_y))
+
+        # Prune circuit breaker window
+        cb_window = self.safety_config.circuit_breaker_window_sec
+        self._recent_click_timestamps = [t for t in self._recent_click_timestamps if now - t < cb_window]
 
         # Dispatch through verified non-physical backend
         if action_type == "DOUBLE_CLICK" and hasattr(self.backend, "dispatch_double_click"):
@@ -198,7 +216,7 @@ class ActionManager:
             result = ActionDispatchResult(ActionDispatchStatus.NOT_SENT, "Backend dispatch returned False", target_screen_pt=(screen_x, screen_y))
 
         if result.status == ActionDispatchStatus.DISPATCHED:
-            clicks_count = 2 if action_type == "DOUBLE_CLICK" else 1
+            clicks_count = planned_cost
             for _ in range(clicks_count):
                 self._recent_click_timestamps.append(now)
             self._total_clicks += clicks_count
@@ -207,8 +225,10 @@ class ActionManager:
             if len(self._recent_click_timestamps) >= self.circuit_breaker_threshold:
                 self._circuit_breaker_tripped = True
                 logger.critical(f"ANTI-RUNAWAY CIRCUIT BREAKER TRIPPED! ({len(self._recent_click_timestamps)} actions in {cb_window} sec). Bot halted.")
-        elif result.status == ActionDispatchStatus.UNCERTAIN and "click 1 sent" in result.reason:
-            # U01 / T01 Outcome Truth: Partial double-click dispatch. Record the 1 transmitted click.
+        elif result.status == ActionDispatchStatus.UNCERTAIN:
+            # Conservative accounting for ambiguous/partial dispatch (V04 / U01):
+            # If click 1 was sent or outcome is uncertain, account conservatively as 1 click
+            # so quotas never understate possible real-world side effects.
             self._recent_click_timestamps.append(now)
             self._total_clicks += 1
             if region_id:
