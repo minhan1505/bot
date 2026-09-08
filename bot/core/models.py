@@ -88,6 +88,9 @@ class RegionModel(BaseModel):
     workflow_id: Optional[str] = None
 
 
+SCHEMA_VERSION: int = 2
+
+
 class SafetyConfig(BaseModel):
     """
     Canonical anti-runaway and quota safety bounds.
@@ -97,6 +100,7 @@ class SafetyConfig(BaseModel):
     circuit_breaker_window_sec: float = 5.0
     max_clicks_per_region: int = 100
     max_total_clicks: int = 1000
+    auto_stop_minutes: float = 0.0
 
 
 class WorkflowStep(BaseModel):
@@ -126,6 +130,8 @@ class Profile(BaseModel):
     """
     profile_id: str
     name: str
+    schema_version: int = SCHEMA_VERSION
+    emergency_hotkey: str = "F12"
     monitor_index: int = 0
     roi: Optional[Tuple[int, int, int, int]] = None # (x, y, w, h)
     regions: Dict[str, RegionModel] = Field(default_factory=dict)

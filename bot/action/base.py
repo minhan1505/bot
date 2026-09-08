@@ -64,6 +64,22 @@ class BaseActionBackend(ABC):
         """
         pass
 
+    def dispatch_double_click(
+        self,
+        screen_x: int,
+        screen_y: int,
+        context: Dict[str, Any]
+    ) -> bool:
+        """
+        Dispatches a background double-click (FC-08).
+        Defaults to two rapid clicks with 50ms interval.
+        """
+        import time
+        res1 = self.dispatch_click(screen_x, screen_y, context)
+        time.sleep(0.050)
+        res2 = self.dispatch_click(screen_x, screen_y, context)
+        return bool(res1) and bool(res2)
+
     @abstractmethod
     def close(self):
         """Releases backend connections."""

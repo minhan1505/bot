@@ -174,8 +174,19 @@ class ActionManager:
         cb_window = self.safety_config.circuit_breaker_window_sec
         self._recent_click_timestamps = [t for t in self._recent_click_timestamps if now - t < cb_window]
 
+        action_type = context.get("action_type", "CLICK")
+        if hasattr(action_type, "value"):
+            action_type = action_type.value
+
+        if action_type == "DETECT_ONLY":
+            return ActionDispatchResult(ActionDispatchStatus.DISPATCHED, "DETECT_ONLY (0 click)", target_screen_pt=(screen_x, screen_y))
+
         # Dispatch through verified non-physical backend
-        raw_result = self.backend.dispatch_click(screen_x, screen_y, context)
+        if action_type == "DOUBLE_CLICK" and hasattr(self.backend, "dispatch_double_click"):
+            raw_result = self.backend.dispatch_double_click(screen_x, screen_y, context)
+        else:
+            raw_result = self.backend.dispatch_click(screen_x, screen_y, context)
+
         if isinstance(raw_result, ActionDispatchResult):
             result = raw_result
         elif bool(raw_result):
@@ -184,10 +195,12 @@ class ActionManager:
             result = ActionDispatchResult(ActionDispatchStatus.NOT_SENT, "Backend dispatch returned False", target_screen_pt=(screen_x, screen_y))
 
         if result.status == ActionDispatchStatus.DISPATCHED:
-            self._recent_click_timestamps.append(now)
-            self._total_clicks += 1
+            clicks_count = 2 if action_type == "DOUBLE_CLICK" else 1
+            for _ in range(clicks_count):
+                self._recent_click_timestamps.append(now)
+            self._total_clicks += clicks_count
             if region_id:
-                self._region_clicks[region_id] = self._region_clicks.get(region_id, 0) + 1
+                self._region_clicks[region_id] = self._region_clicks.get(region_id, 0) + clicks_count
             if len(self._recent_click_timestamps) >= self.circuit_breaker_threshold:
                 self._circuit_breaker_tripped = True
                 logger.critical(f"ANTI-RUNAWAY CIRCUIT BREAKER TRIPPED! ({len(self._recent_click_timestamps)} actions in {cb_window} sec). Bot halted.")

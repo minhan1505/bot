@@ -36,12 +36,18 @@ class ProfileBundleManager:
             profile_json = profile.model_dump_json(indent=2)
             zf.writestr("profile.json", profile_json)
 
-            # 2. Archive target reference images
+            # 2. Archive target reference and confuser images (FC-12)
             for t_id, target in profile.targets.items():
                 for idx, img_path in enumerate(target.reference_image_paths):
                     if os.path.exists(img_path):
                         ext = os.path.splitext(img_path)[1]
-                        arc_name = f"targets/{t_id}_{idx}{ext}"
+                        arc_name = f"targets/{t_id}_ref_{idx}{ext}"
+                        zf.write(img_path, arc_name)
+
+                for idx, img_path in enumerate(target.confuser_image_paths):
+                    if os.path.exists(img_path):
+                        ext = os.path.splitext(img_path)[1]
+                        arc_name = f"confusers/{t_id}_conf_{idx}{ext}"
                         zf.write(img_path, arc_name)
 
         logger.info(f"Profile '{profile.name}' exported to ZIP: {zip_output_path}")
@@ -54,7 +60,7 @@ class ProfileBundleManager:
     ) -> Tuple[Optional[Profile], str]:
         """
         Safely extracts and reconstructs a Profile from a ZIP package.
-        Includes strict Zip Slip / Path Traversal protection.
+        Includes strict Zip Slip / Path Traversal protection and geometry revalidation (FC-12).
         """
         if not os.path.exists(zip_path):
             return None, f"ZIP file not found: {zip_path}"
@@ -77,7 +83,9 @@ class ProfileBundleManager:
 
                 raw_json = zf.read("profile.json").decode("utf-8")
                 profile_dict = json.loads(raw_json)
-                profile = Profile.model_validate(profile_dict)
+
+                from bot.core.database import migrate_profile_data
+                profile, _ = migrate_profile_data(profile_dict)
 
                 # Security Check: Validate profile_id format to prevent directory traversal or collision
                 import re
@@ -86,30 +94,69 @@ class ProfileBundleManager:
 
                 dest_canonical = os.path.realpath(dest_targets_dir)
 
-                # 2. Extract target images and remap local paths
+                # 2. Extract target reference and confuser images and remap local paths
                 for t_id, target in profile.targets.items():
-                    # Validate t_id format as well
                     if not re.match(r'^[a-zA-Z0-9_-]+$', t_id) or len(t_id) > 64:
                         return None, f"SECURITY_ERROR: Invalid target_id '{t_id}'."
 
+                    # Reference images
                     new_ref_paths = []
                     for idx in range(len(target.reference_image_paths)):
                         for ext in [".png", ".jpg", ".bmp"]:
-                            arc_candidate = f"targets/{t_id}_{idx}{ext}"
+                            arc_candidates = [
+                                f"targets/{t_id}_ref_{idx}{ext}",
+                                f"targets/{t_id}_{idx}{ext}"  # Backwards compatibility
+                            ]
+                            for arc_candidate in arc_candidates:
+                                if arc_candidate in zf.namelist():
+                                    local_filename = f"{profile.profile_id}_{t_id}_ref_{idx}{ext}"
+                                    local_path = os.path.realpath(os.path.join(dest_targets_dir, local_filename))
+
+                                    if os.path.commonpath([dest_canonical, local_path]) != dest_canonical:
+                                        return None, f"SECURITY_ERROR: Path traversal detected: {local_path}"
+
+                                    with open(local_path, "wb") as f_out:
+                                        f_out.write(zf.read(arc_candidate))
+                                    new_ref_paths.append(local_path)
+                                    break
+                    if new_ref_paths:
+                        target.reference_image_paths = new_ref_paths
+
+                    # Confuser images (FC-12)
+                    new_conf_paths = []
+                    for idx in range(len(target.confuser_image_paths)):
+                        for ext in [".png", ".jpg", ".bmp"]:
+                            arc_candidate = f"confusers/{t_id}_conf_{idx}{ext}"
                             if arc_candidate in zf.namelist():
-                                local_filename = f"{profile.profile_id}_{t_id}_{idx}{ext}"
+                                local_filename = f"{profile.profile_id}_{t_id}_conf_{idx}{ext}"
                                 local_path = os.path.realpath(os.path.join(dest_targets_dir, local_filename))
 
-                                # Path Traversal Verification using normalized canonical path
                                 if os.path.commonpath([dest_canonical, local_path]) != dest_canonical:
                                     return None, f"SECURITY_ERROR: Path traversal detected: {local_path}"
 
                                 with open(local_path, "wb") as f_out:
                                     f_out.write(zf.read(arc_candidate))
-                                new_ref_paths.append(local_path)
+                                new_conf_paths.append(local_path)
                                 break
-                    if new_ref_paths:
-                        target.reference_image_paths = new_ref_paths
+                    if new_conf_paths:
+                        target.confuser_image_paths = new_conf_paths
+
+                # 3. Geometry Revalidation (FC-12)
+                try:
+                    import mss
+                    mss_cls = getattr(mss, "MSS", mss.mss)
+                    with mss_cls() as sct:
+                        v_mon = sct.monitors[0]
+                        v_w, v_h = v_mon["width"], v_mon["height"]
+                        if profile.roi:
+                            rx, ry, rw, rh = profile.roi
+                            if rw > v_w or rh > v_h:
+                                logger.warning(f"Imported ROI {profile.roi} exceeds current screen bounds ({v_w}x{v_h}).")
+                        for r_id, reg in profile.regions.items():
+                            if reg.w > v_w or reg.h > v_h:
+                                logger.warning(f"Imported region '{r_id}' dimensions ({reg.w}x{reg.h}) exceed display bounds ({v_w}x{v_h}).")
+                except Exception as geo_err:
+                    logger.warning(f"Geometry revalidation check encountered warning: {geo_err}")
 
                 logger.info(f"Profile '{profile.name}' safely imported from {zip_path}")
                 return profile, "IMPORT_SUCCESS"

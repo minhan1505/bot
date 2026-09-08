@@ -45,8 +45,10 @@ class BotRuntimeRunner:
         telemetry_logger: Optional[AsyncTelemetryLogger] = None,
         is_dry_run: bool = False,
         is_production: bool = False,
+        is_shadow: bool = False,
         on_decision_callback: Optional[Callable[[DecisionResult], None]] = None,
-        on_state_callback: Optional[Callable[[str, str, int], None]] = None
+        on_state_callback: Optional[Callable[[str, str, int], None]] = None,
+        on_shadow_evidence_callback: Optional[Callable[[dict], None]] = None
     ):
         self.profile = profile
         self.capture_manager = capture_manager
@@ -56,23 +58,27 @@ class BotRuntimeRunner:
         self.telemetry = telemetry_logger
         self.is_dry_run = is_dry_run
         self.is_production = is_production
+        self.is_shadow = is_shadow
         self.on_decision = on_decision_callback
         self.on_state_change = on_state_callback
+        self.on_shadow_evidence = on_shadow_evidence_callback
 
         self.scheduler = TwoTierScheduler(tier2_group_count=3)
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
         self._session_id = f"session_{int(time.time())}"
+        self._start_time = 0.0
         self.total_evaluations = 0
         self.total_matches = 0
 
     def start(self):
         """Starts real-time background worker loop."""
         self._stop_event.clear()
+        self._start_time = time.time()
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
-        logger.info(f"BotRuntimeRunner started (Session: {self._session_id}, DryRun={self.is_dry_run})")
+        logger.info(f"BotRuntimeRunner started (Session: {self._session_id}, DryRun={self.is_dry_run}, Shadow={self.is_shadow})")
 
     def stop(self):
         """Stops background worker cleanly."""
@@ -86,10 +92,37 @@ class BotRuntimeRunner:
     def is_running(self) -> bool:
         return self._thread is not None and self._thread.is_alive() and not self._stop_event.is_set()
 
+    def _save_evidence_crop_async(self, frame: np.ndarray, rect: Tuple[int, int, int, int], res: DecisionResult):
+        """Saves candidate crop asynchronously to evidence directory without blocking (FC-11)."""
+        def _worker():
+            try:
+                x, y, w, h = rect
+                h_f, w_f = frame.shape[:2]
+                x1, y1 = max(0, min(x, w_f)), max(0, min(y, h_f))
+                x2, y2 = max(x1, min(x + w, w_f)), max(y1, min(y + h, h_f))
+                if x2 - x1 < 4 or y2 - y1 < 4:
+                    return
+                crop = frame[y1:y2, x1:x2].copy()
+                evidence_dir = os.path.abspath("data/evidence")
+                os.makedirs(evidence_dir, exist_ok=True)
+                fname = f"{int(time.time() * 1000)}_{res.target_id}_{res.decision.value}.png"
+                cv2.imwrite(os.path.join(evidence_dir, fname), crop)
+            except Exception:
+                pass
+        threading.Thread(target=_worker, daemon=True).start()
+
     def _run_loop(self):
         scan_interval_sec = max(0.005, self.profile.scan_interval_ms / 1000.0)
 
         while not self._stop_event.is_set():
+            # Check profile auto-stop limit (FC-10)
+            if self.profile.safety_config and self.profile.safety_config.auto_stop_minutes > 0:
+                elapsed_min = (time.time() - self._start_time) / 60.0
+                if elapsed_min >= self.profile.safety_config.auto_stop_minutes:
+                    logger.critical(f"AUTO_STOP_LIMIT_REACHED: Profile duration limit ({self.profile.safety_config.auto_stop_minutes}m) exceeded. Stopping runner.")
+                    self._stop_event.set()
+                    break
+
             t_cycle_start = time.perf_counter()
 
             # 1. Capture screen frame
@@ -119,7 +152,7 @@ class BotRuntimeRunner:
                 target_cfg = self.profile.targets.get(target_id)
                 region_cfg = self.profile.regions.get(r_id)
 
-                if not target_cfg or not region_cfg or not target_cfg.reference_image_paths:
+                if not target_cfg or not getattr(target_cfg, "enabled", True) or not region_cfg or not target_cfg.reference_image_paths:
                     continue
 
                 # Read reference image
@@ -157,7 +190,7 @@ class BotRuntimeRunner:
                         continue
 
                     target_cfg = self.profile.targets.get(expected_target_id)
-                    if not target_cfg or not target_cfg.reference_image_paths:
+                    if not target_cfg or not getattr(target_cfg, "enabled", True) or not target_cfg.reference_image_paths:
                         continue
 
                     import cv2
@@ -194,6 +227,12 @@ class BotRuntimeRunner:
 
                         if self.telemetry:
                             self.telemetry.log_event("DECISION", res.model_dump())
+
+                        # Save evidence crop if low margin or UNKNOWN/REJECT (FC-11)
+                        if res.decision != DecisionClass.MATCH:
+                            self._save_evidence_crop_async(frame, res.candidate_rect, res)
+                        elif target_cfg.calibration and res.identity_margin < target_cfg.calibration.m_safe * 1.5:
+                            self._save_evidence_crop_async(frame, res.candidate_rect, res)
 
                         if res.decision == DecisionClass.MATCH:
                             self.total_matches += 1
@@ -323,6 +362,7 @@ class BotRuntimeRunner:
                                     screen_x = cand_cx + desktop_offset[0]
                                     screen_y = cand_cy + desktop_offset[1]
 
+                                    step = inst.current_step
                                     backend = getattr(self.action_manager, "backend", None)
                                     action_context = {
                                         "hwnd": getattr(backend, "hwnd", None),
@@ -335,12 +375,40 @@ class BotRuntimeRunner:
                                         "viewport_context": getattr(backend, "viewport_context", None),
                                         "is_production": self.is_production,
                                         "verify_freshness": self.is_production,
+                                        "action_type": step.action_type if step else ActionType.CLICK,
                                     }
 
-                                    step = inst.current_step
                                     if step and step.action_type == ActionType.DETECT_ONLY:
                                         # DETECT_ONLY: Advance without physical dispatch
                                         logger.info(f"[DETECT_ONLY] Target '{expected_target_id}' detected for Region {owner_region}")
+                                        inst.on_action_dispatched()
+                                        inst.advance_step()
+                                        if self.on_state_change:
+                                            self.on_state_change(owner_region, inst.state.value, inst.current_step_index)
+                                    elif self.is_shadow:
+                                        # FC-09: Shadow Mode dedicated comparison/evidence stream (0 dispatch)
+                                        logger.info(f"[SHADOW-MODE] Predicted match at ({screen_x}, {screen_y}) for Region {owner_region}, step {inst.current_step_index}")
+                                        shadow_data = {
+                                            "event": "SHADOW_COMPARISON",
+                                            "region_id": owner_region,
+                                            "workflow_id": inst.workflow.workflow_id,
+                                            "step_index": inst.current_step_index,
+                                            "target_id": expected_target_id,
+                                            "screen_pos": (screen_x, screen_y),
+                                            "decision": res.decision.value,
+                                            "geometry_score": res.geometry_score,
+                                            "embedding_similarity": res.embedding_similarity,
+                                            "identity_margin": res.identity_margin,
+                                            "latency_ms": res.latency_ms,
+                                            "timestamp": time.time()
+                                        }
+                                        if self.telemetry:
+                                            self.telemetry.log_event("SHADOW_COMPARISON", shadow_data)
+                                        if self.on_shadow_evidence:
+                                            try:
+                                                self.on_shadow_evidence(shadow_data)
+                                            except Exception:
+                                                pass
                                         inst.on_action_dispatched()
                                         inst.advance_step()
                                         if self.on_state_change:

@@ -183,6 +183,67 @@ class VisionEngine:
 
         return results
 
+    def test_target_on_frame(
+        self,
+        frame: np.ndarray,
+        target: Target,
+        alternative_targets: Optional[Dict[str, np.ndarray]] = None,
+        region_rect: Optional[Rect] = None
+    ) -> List[DecisionResult]:
+        """
+        Tests a target against an offline frame or live capture frame (FC-06).
+        Returns list of DecisionResult reports for all candidate proposals.
+        Guarantees ZERO action dispatch.
+        """
+        import cv2
+        t_start = time.perf_counter()
+        if not target.reference_image_paths:
+            return []
+
+        ref_img = cv2.imread(target.reference_image_paths[0])
+        if ref_img is None:
+            return []
+
+        h_f, w_f = frame.shape[:2]
+        if region_rect is None:
+            region_rect = Rect(0, 0, w_f, h_f)
+
+        rx1 = max(0, min(region_rect.x, w_f))
+        ry1 = max(0, min(region_rect.y, h_f))
+        rx2 = max(rx1, min(region_rect.right, w_f))
+        ry2 = max(ry1, min(region_rect.bottom, h_f))
+
+        if rx2 - rx1 < 4 or ry2 - ry1 < 4:
+            return []
+
+        region_crop = frame[ry1:ry2, rx1:rx2]
+        proposals = self.proposal_engine.generate_proposals_for_region(
+            region_crop, region_rect, ref_img, region_id="test_region"
+        )
+        if not proposals:
+            return []
+
+        target_to_eval = target
+        if target.calibration is None:
+            # Temporary non-production calibration for offline inspection
+            target_to_eval = target.model_copy()
+            target_to_eval.calibration = CalibrationProfile(
+                model_sha256=self.onnx_verifier.model_sha256,
+                precision=self.onnx_verifier.precision,
+                canonical_size=self.canonical_size,
+                t_g=0.5,
+                t_e=0.65,
+                m_safe=0.05
+            )
+
+        decisions = self.evaluate_candidates(
+            frame, proposals, target_to_eval, ref_img, alternative_targets
+        )
+        t_total_ms = (time.perf_counter() - t_start) * 1000.0
+        for d in decisions:
+            d.latency_ms = t_total_ms
+        return decisions
+
     def clear_target_cache(self):
         """Invalidates all cached target embeddings."""
         self.onnx_verifier.clear_target_cache()
