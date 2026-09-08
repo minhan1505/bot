@@ -81,6 +81,20 @@ class ActionManager:
 
         return self.is_supported, self.support_status_message
 
+    def invalidate_binding(self, reason: str = "geometry_invalidation") -> None:
+        """
+        Invalidates current backend surface binding on geometry drift, window move/resize, or DPR change.
+        """
+        logger.warning(f"ActionManager surface binding invalidated: {reason}")
+        self.is_surface_verified = False
+        self.viewport_context = None
+        self.support_status_message = f"BINDING_INVALIDATED: {reason}"
+        if self.backend and hasattr(self.backend, "invalidate_surface_context"):
+            try:
+                self.backend.invalidate_surface_context(reason)
+            except Exception:
+                pass
+
     def trigger_emergency_stop(self):
         """Emergency stop handler (e.g. on F12 keypress)."""
         self.emergency_stop_triggered = True
@@ -118,6 +132,17 @@ class ActionManager:
         if context.get("is_production", False) and not self.is_surface_verified:
             logger.error("Action dispatch rejected: SURFACE_UNVERIFIED_ACTION_BLOCKED. Protocol ACK is not surface verification.")
             return ActionDispatchResult(ActionDispatchStatus.FAIL_CLOSED, "SURFACE_UNVERIFIED_ACTION_BLOCKED", target_screen_pt=(screen_x, screen_y))
+
+        # Check geometry freshness if requested or if backend supports it
+        if context.get("verify_freshness", False) and hasattr(self.backend, "verify_viewport_freshness"):
+            fresh, fresh_err = self.backend.verify_viewport_freshness(self.viewport_context)
+            if not fresh:
+                self.invalidate_binding(fresh_err)
+                return ActionDispatchResult(
+                    ActionDispatchStatus.FAIL_CLOSED,
+                    f"GEOMETRY_FRESHNESS_FAILED: {fresh_err}",
+                    target_screen_pt=(screen_x, screen_y)
+                )
 
         # Total click quota check
         if self._total_clicks >= self.safety_config.max_total_clicks:

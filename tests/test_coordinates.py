@@ -45,8 +45,38 @@ def test_css_pixels_scaling():
         scroll_offset=(0, 0)
     )
 
-    # Screen Y = 90px (50px client offset + 40px viewport offset -> Viewport Y = 0)
-    # Screen X = 125px -> Viewport X = 125px -> CSS X = 125 / 1.25 = 100 CSS px
     css_x, css_y = CoordinateMapper.screen_to_css_pixels(125, 90, ctx)
     assert css_x == pytest.approx(100.0, abs=1e-3)
     assert css_y == pytest.approx(0.0, abs=1e-3)
+
+
+def test_screen_to_css_pixels_viewport_ignores_scroll_for_cdp():
+    # CDP Input.dispatchMouseEvent requires Viewport CSS coordinates (clientX/clientY).
+    # Page scroll must not shift viewport coordinates.
+    ctx = ViewportContext(
+        window_rect=Rect(0, 0, 1920, 1080),
+        client_rect=Rect(0, 50, 1920, 1030),
+        viewport_offset=(0, 40),
+        device_pixel_ratio=1.25,
+        scroll_offset=(500, 1200) # Non-zero document scroll
+    )
+
+    # Physical screen pt (125, 90) -> Viewport physical pt (125, 0) -> CSS (100.0, 0.0)
+    css_x, css_y = CoordinateMapper.screen_to_css_pixels(125, 90, ctx)
+    assert css_x == pytest.approx(100.0, abs=1e-3)
+    assert css_y == pytest.approx(0.0, abs=1e-3)
+
+
+def test_screen_to_document_css_pixels_includes_scroll():
+    ctx = ViewportContext(
+        window_rect=Rect(0, 0, 1920, 1080),
+        client_rect=Rect(0, 50, 1920, 1030),
+        viewport_offset=(0, 40),
+        device_pixel_ratio=1.25,
+        scroll_offset=(500, 1200)
+    )
+
+    doc_x, doc_y = CoordinateMapper.screen_to_document_css_pixels(125, 90, ctx)
+    assert doc_x == pytest.approx(600.0, abs=1e-3)
+    assert doc_y == pytest.approx(1200.0, abs=1e-3)
+

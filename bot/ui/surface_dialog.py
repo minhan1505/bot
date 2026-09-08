@@ -367,10 +367,33 @@ class SurfaceVerificationDialog(QDialog):
                     await ws.send(json.dumps(move_msg))
                     await asyncio.wait_for(ws.recv(), timeout=3.0)
 
-                    # 4. Check target surface reaction
+                    # 4. Check target surface reaction & application-level evidence
                     script_verify = """
                     (() => {
-                        return window.__bot_surface_reaction || { received: false };
+                        const rx = window.__bot_surface_reaction || { received: false };
+                        const center_x = Math.round(window.innerWidth / 2);
+                        const center_y = Math.round(window.innerHeight / 2);
+                        const targetEl = document.elementFromPoint(center_x, center_y) || document.body;
+                        let hoverActive = false;
+                        try {
+                            hoverActive = targetEl.matches(':hover');
+                        } catch(e) {}
+
+                        let hasCanvasContext = false;
+                        if (targetEl && targetEl.tagName.toLowerCase() === 'canvas') {
+                            hasCanvasContext = !!(targetEl.getContext('2d') || targetEl.getContext('webgl') || targetEl.getContext('webgl2'));
+                        }
+
+                        const canvasesWithCtx = Array.from(document.querySelectorAll('canvas')).filter(c => {
+                            return !!(c.getContext('2d') || c.getContext('webgl') || c.getContext('webgl2'));
+                        }).length;
+
+                        return {
+                            ...rx,
+                            hoverActive: hoverActive,
+                            hasCanvasContext: hasCanvasContext,
+                            canvasesWithContextCount: canvasesWithCtx
+                        };
                     })()
                     """
                     msg4 = {"id": 1004, "method": "Runtime.evaluate", "params": {"expression": script_verify, "returnByValue": True}}
@@ -378,11 +401,16 @@ class SurfaceVerificationDialog(QDialog):
                     res4 = json.loads(await asyncio.wait_for(ws.recv(), timeout=3.0))
                     reaction = res4.get("result", {}).get("result", {}).get("value", {})
 
-                    probe_ok = reaction.get("received", False)
+                    received = bool(reaction.get("received", False))
+                    matched = bool(reaction.get("eventTargetMatched", False))
+                    raf_ok = bool(reaction.get("rafActive", False))
+                    hover_ok = bool(reaction.get("hoverActive", False))
+                    has_ctx = bool(reaction.get("hasCanvasContext", False))
                     target_tag = reaction.get("targetTagName", "")
-                    matched = reaction.get("eventTargetMatched", False)
-                    raf_ok = reaction.get("rafActive", False)
-                    diag = f"Target Surface <{target_tag}>: received={probe_ok}, matched={matched}, rafActive={raf_ok}"
+
+                    # Strict tri-condition gate: received AND matched (no overlay interception) AND rafActive (active render loop)
+                    probe_ok = bool(received and matched and raf_ok)
+                    diag = f"Target Surface <{target_tag}>: received={received}, matched={matched}, rafActive={raf_ok}, hoverActive={hover_ok}, canvasCtx={has_ctx}"
                     return info, probe_ok, diag
 
             surface_data, probe_ok, probe_msg = asyncio.run(_run_active_surface_probe())
@@ -413,7 +441,9 @@ class SurfaceVerificationDialog(QDialog):
                 return
 
             if not probe_ok:
-                self._log("✖ Stage 2 Warning: Target application surface did not acknowledge event delivery.")
+                self._log(f"✖ Stage 2 Failed: Target surface verification gate failed ({probe_msg}).")
+                self.lbl_status.setText("STATUS: SURFACE_PROBE_REJECTED")
+                self.lbl_status.setStyleSheet("font-weight: bold; padding: 6px; background: #ffcdd2; color: #b71c1c;")
                 return
 
             # Verify physical cursor independence
@@ -423,23 +453,31 @@ class SurfaceVerificationDialog(QDialog):
                 self._log("✖ MOUSE_INDEPENDENCE_VIOLATION: System cursor moved during probe!")
                 return
 
-            client_w = int(round(w * dpr))
-            client_h = int(round(h * dpr))
-            win_w = max(int(ow), client_w)
-            win_h = max(int(oh), client_h)
-            top_bar = max(0, oh - client_h)
-            side_border = max(0, (ow - client_w) // 2)
-            client_screen_x = int(sx + side_border)
-            client_screen_y = int(sy + top_bar)
+            # High-DPI coordinate scaling: Chrome reports screenX/Y, outerWidth/Height, and innerWidth/Height in CSS pixels.
+            # Convert all metrics to physical screen pixels via devicePixelRatio.
+            phys_dpr = max(0.1, float(dpr))
+            phys_w = int(round(w * phys_dpr))
+            phys_h = int(round(h * phys_dpr))
+            phys_sx = int(round(sx * phys_dpr))
+            phys_sy = int(round(sy * phys_dpr))
+            phys_ow = int(round(ow * phys_dpr))
+            phys_oh = int(round(oh * phys_dpr))
 
-            window_rect = Rect(x=int(sx), y=int(sy), w=win_w, h=win_h)
-            client_rect = Rect(x=client_screen_x, y=client_screen_y, w=client_w, h=client_h)
+            win_w = max(phys_ow, phys_w)
+            win_h = max(phys_oh, phys_h)
+            top_bar = max(0, phys_oh - phys_h)
+            side_border = max(0, (phys_ow - phys_w) // 2)
+            client_screen_x = int(phys_sx + side_border)
+            client_screen_y = int(phys_sy + top_bar)
+
+            window_rect = Rect(x=phys_sx, y=phys_sy, w=win_w, h=win_h)
+            client_rect = Rect(x=client_screen_x, y=client_screen_y, w=phys_w, h=phys_h)
 
             vp_ctx = ViewportContext(
                 window_rect=window_rect,
                 client_rect=client_rect,
                 viewport_offset=(0, 0),
-                device_pixel_ratio=float(dpr),
+                device_pixel_ratio=phys_dpr,
                 scroll_offset=(int(scroll_x), int(scroll_y))
             )
 

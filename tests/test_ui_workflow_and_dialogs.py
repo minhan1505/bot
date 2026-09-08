@@ -481,5 +481,252 @@ def test_surface_dialog_cdp_probe_constructs_valid_viewport_context():
     assert isinstance(action_mgr.viewport_context.window_rect, Rect)
     assert isinstance(action_mgr.viewport_context.client_rect, Rect)
     assert action_mgr.viewport_context.device_pixel_ratio == 1.25
+    assert action_mgr.viewport_context.window_rect.x == 125
+    assert action_mgr.viewport_context.client_rect.w == int(round(1920 * 1.25))
+
+
+def test_surface_dialog_fails_when_matched_is_false():
+    """Fail-Closed: If eventTargetMatched is False (overlay interception), probe MUST fail."""
+    from bot.ui.surface_dialog import SurfaceVerificationDialog
+    import json
+
+    action_mgr = ActionManager()
+    dlg = SurfaceVerificationDialog(action_mgr)
+    dlg.combo_cdp_tabs.addItem("Test Tab", "ws://127.0.0.1:9222/devtools/page/test")
+    dlg.combo_cdp_tabs.setCurrentIndex(dlg.combo_cdp_tabs.count() - 1)
+
+    eval_resp_1 = {
+        "result": {"result": {"value": {
+            "title": "Casino Table", "innerWidth": 1000, "innerHeight": 800,
+            "devicePixelRatio": 1.0, "screenX": 0, "screenY": 0,
+            "outerWidth": 1000, "outerHeight": 800, "scrollX": 0, "scrollY": 0,
+            "targetElement": {"tagName": "CANVAS"}
+        }}}
+    }
+    eval_resp_4 = {
+        "result": {"result": {"value": {
+            "received": True,
+            "targetTagName": "CANVAS",
+            "eventTargetMatched": False, # Intercepted by overlay!
+            "rafActive": True
+        }}}
+    }
+
+    class MockWs:
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            pass
+        async def send(self, msg):
+            pass
+        async def recv(self):
+            if not hasattr(self, "_idx"):
+                self._idx = 0
+            self._idx += 1
+            if self._idx == 1:
+                return json.dumps(eval_resp_1)
+            elif self._idx == 2 or self._idx == 3:
+                return json.dumps({})
+            else:
+                return json.dumps(eval_resp_4)
+
+    with patch("bot.ui.surface_dialog.websockets.connect", return_value=MockWs()):
+        with patch("bot.action.cdp_backend.CDPActionBackend.probe_capability", return_value=(True, "OK")):
+            with patch("bot.ui.surface_dialog.get_physical_cursor_pos", return_value=(500, 500)):
+                dlg._probe_cdp()
+
+    assert dlg.probe_success is False
+    assert action_mgr.is_surface_verified is False
+    assert "SURFACE_PROBE_REJECTED" in dlg.lbl_status.text()
+
+
+def test_surface_dialog_fails_when_raf_is_false():
+    """Fail-Closed: If rafActive is False (render loop halted / tab throttled), probe MUST fail."""
+    from bot.ui.surface_dialog import SurfaceVerificationDialog
+    import json
+
+    action_mgr = ActionManager()
+    dlg = SurfaceVerificationDialog(action_mgr)
+    dlg.combo_cdp_tabs.addItem("Test Tab", "ws://127.0.0.1:9222/devtools/page/test")
+    dlg.combo_cdp_tabs.setCurrentIndex(dlg.combo_cdp_tabs.count() - 1)
+
+    eval_resp_1 = {
+        "result": {"result": {"value": {
+            "title": "Casino Table", "innerWidth": 1000, "innerHeight": 800,
+            "devicePixelRatio": 1.0, "screenX": 0, "screenY": 0,
+            "outerWidth": 1000, "outerHeight": 800, "scrollX": 0, "scrollY": 0,
+            "targetElement": {"tagName": "CANVAS"}
+        }}}
+    }
+    eval_resp_4 = {
+        "result": {"result": {"value": {
+            "received": True,
+            "targetTagName": "CANVAS",
+            "eventTargetMatched": True,
+            "rafActive": False # Frozen render loop!
+        }}}
+    }
+
+    class MockWs:
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            pass
+        async def send(self, msg):
+            pass
+        async def recv(self):
+            if not hasattr(self, "_idx"):
+                self._idx = 0
+            self._idx += 1
+            if self._idx == 1:
+                return json.dumps(eval_resp_1)
+            elif self._idx == 2 or self._idx == 3:
+                return json.dumps({})
+            else:
+                return json.dumps(eval_resp_4)
+
+    with patch("bot.ui.surface_dialog.websockets.connect", return_value=MockWs()):
+        with patch("bot.action.cdp_backend.CDPActionBackend.probe_capability", return_value=(True, "OK")):
+            with patch("bot.ui.surface_dialog.get_physical_cursor_pos", return_value=(500, 500)):
+                dlg._probe_cdp()
+
+    assert dlg.probe_success is False
+    assert action_mgr.is_surface_verified is False
+    assert "SURFACE_PROBE_REJECTED" in dlg.lbl_status.text()
+
+
+def test_target_calibration_dialog_rejects_overlapping_provenance_ids(tmp_path):
+    """Verifies TargetCalibrationDialog blocks calibration when session_id or run_id overlap."""
+    import cv2
+    import numpy as np
+    from bot.ui.calibration_dialog import TargetCalibrationDialog
+
+    img1 = np.zeros((48, 48, 3), dtype=np.uint8)
+    cv2.circle(img1, (24, 24), 8, (255, 255, 255), -1)
+    img2 = np.zeros((48, 48, 3), dtype=np.uint8)
+    cv2.rectangle(img2, (10, 10), (38, 38), (255, 255, 255), -1)
+
+    file_a = str(tmp_path / "img_pos_a.png")
+    file_b = str(tmp_path / "img_pos_b.png")
+    cv2.imwrite(file_a, img1)
+    cv2.imwrite(file_b, img2)
+
+    conf_a = str(tmp_path / "conf_a.png")
+    conf_b = str(tmp_path / "conf_b.png")
+    cv2.imwrite(conf_a, np.ones((48, 48, 3), dtype=np.uint8) * 30)
+    cv2.imwrite(conf_b, np.ones((48, 48, 3), dtype=np.uint8) * 80)
+
+    target = Target(target_id="t_prov", name="Target Prov")
+    profile = Profile(profile_id="p_test", name="Profile")
+
+    dlg = TargetCalibrationDialog(target, profile, MagicMock(), MagicMock())
+    dlg.session_a_pos = [file_a]
+    dlg.session_b_pos = [file_b]
+    dlg.session_a_neg = [conf_a]
+    dlg.session_b_neg = [conf_b]
+
+    # Force identical session IDs
+    dlg.txt_session_a.setText("SAME_SESSION")
+    dlg.txt_session_b.setText("SAME_SESSION")
+
+    with patch("PySide6.QtWidgets.QMessageBox.critical") as mock_crit:
+        dlg._run_calibration()
+        mock_crit.assert_called_once()
+        assert "Session IDs must be distinct" in mock_crit.call_args[0][2]
+
+    # Distinct sessions, but identical run IDs
+    dlg.txt_session_a.setText("session_1")
+    dlg.txt_session_b.setText("session_2")
+    dlg.txt_run_a.setText("SAME_RUN")
+    dlg.txt_run_b.setText("SAME_RUN")
+
+    with patch("PySide6.QtWidgets.QMessageBox.critical") as mock_crit:
+        dlg._run_calibration()
+        mock_crit.assert_called_once()
+        assert "Run IDs must be distinct" in mock_crit.call_args[0][2]
+
+
+def test_cdp_backend_freshness_check_invalidates_on_geometry_drift():
+    """Verifies verify_viewport_freshness detects DPR drift and window resize, invalidating context."""
+    from bot.action.cdp_backend import CDPActionBackend
+    from bot.core.coordinates import ViewportContext, Rect
+    import json
+
+    ctx = ViewportContext(
+        window_rect=Rect(0, 0, 1920, 1080),
+        client_rect=Rect(0, 0, 1920, 1080),
+        device_pixel_ratio=1.0,
+        scroll_offset=(0, 0)
+    )
+
+    backend = CDPActionBackend()
+    backend.ws_url = "ws://127.0.0.1:9222/test"
+    backend.viewport_context = ctx
+
+    class MockWs:
+        def __init__(self, dpr, w, h):
+            self.dpr = dpr
+            self.w = w
+            self.h = h
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            pass
+        async def send(self, msg):
+            pass
+        async def recv(self):
+            return json.dumps({
+                "result": {"result": {"value": {
+                    "dpr": self.dpr, "innerWidth": self.w, "innerHeight": self.h
+                }}}
+            })
+
+    # 1. Fresh case
+    with patch("bot.action.cdp_backend.websockets.connect", return_value=MockWs(1.0, 1920, 1080)):
+        fresh, msg = backend.verify_viewport_freshness(ctx)
+        assert fresh is True
+        assert msg == "FRESH"
+        assert backend.viewport_context is not None
+
+    # 2. Resized case
+    with patch("bot.action.cdp_backend.websockets.connect", return_value=MockWs(1.0, 1280, 720)):
+        fresh, msg = backend.verify_viewport_freshness(ctx)
+        assert fresh is False
+        assert "VIEWPORT_RESIZED" in msg
+        assert backend.viewport_context is None # Invalidated!
+
+    # 3. DPR drift case
+    backend.viewport_context = ctx
+    with patch("bot.action.cdp_backend.websockets.connect", return_value=MockWs(1.5, 1920, 1080)):
+        fresh, msg = backend.verify_viewport_freshness(ctx)
+        assert fresh is False
+        assert "DPR_DRIFT" in msg
+        assert backend.viewport_context is None # Invalidated!
+
+
+def test_action_manager_invalidate_binding():
+    """Verifies ActionManager.invalidate_binding resets surface verification state."""
+    from bot.action.cdp_backend import CDPActionBackend
+    from bot.core.coordinates import ViewportContext, Rect
+
+    backend = CDPActionBackend()
+    backend.viewport_context = ViewportContext(
+        window_rect=Rect(0, 0, 100, 100),
+        client_rect=Rect(0, 0, 100, 100)
+    )
+
+    action_mgr = ActionManager()
+    action_mgr.backend = backend
+    action_mgr.is_supported = True
+    action_mgr.is_surface_verified = True
+    action_mgr.viewport_context = backend.viewport_context
+
+    action_mgr.invalidate_binding("window_moved")
+
+    assert action_mgr.is_surface_verified is False
+    assert action_mgr.viewport_context is None
+    assert "window_moved" in action_mgr.support_status_message
+    assert backend.viewport_context is None
+
 
 

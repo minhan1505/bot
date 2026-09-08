@@ -68,3 +68,11 @@ class BaseActionBackend(ABC):
     def close(self):
         """Releases backend connections."""
         pass
+
+    def invalidate_surface_context(self, reason: str = "context_invalidated") -> None:
+        """Invalidates surface context on geometry drift or resolution change."""
+        pass
+
+    def verify_viewport_freshness(self, ctx: Optional[Any] = None) -> Tuple[bool, str]:
+        """Verifies that surface geometry has not drifted from context."""
+        return True, "FRESH"

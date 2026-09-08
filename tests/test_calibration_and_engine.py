@@ -97,6 +97,58 @@ def test_calibration_data_leakage_rejected():
     assert "DATA_LEAKAGE_DETECTED" in str(exc_info.value)
 
 
+def test_calibration_run_id_overlap_rejected():
+    geo_verifier = GeometryVerifier(canonical_size=(64, 64))
+    onnx_verifier = ONNXVerifier(model_path=MODEL_PATH, canonical_size=(64, 64))
+    calib_engine = CalibrationEngine(geo_verifier, onnx_verifier, canonical_size=(64, 64))
+
+    target_img = make_glyph_image("CHECK")
+    alt_img = make_glyph_image("CROSS")
+    # Distinct session IDs but overlapping run IDs ("run_shared")
+    d_calib = [
+        EvaluationSample(image=target_img, is_positive=True, label="target_1", session_id="session_A", device_id="D1", run_id="run_shared"),
+        EvaluationSample(image=alt_img, is_positive=False, label="neg_1", session_id="session_A", device_id="D1", run_id="run_shared"),
+    ]
+    d_val = [
+        EvaluationSample(image=target_img, is_positive=True, label="target_1", session_id="session_B", device_id="D1", run_id="run_shared"),
+        EvaluationSample(image=alt_img, is_positive=False, label="neg_1", session_id="session_B", device_id="D1", run_id="run_shared"),
+    ]
+
+    with pytest.raises(CalibrationOverlapError) as exc_info:
+        calib_engine.calibrate_target("target_1", target_img, d_calib, d_val, alternative_identity_imgs={"alt_1": alt_img})
+
+    assert "DATA_LEAKAGE_DETECTED" in str(exc_info.value)
+    assert "Capture runs" in str(exc_info.value)
+
+
+def test_calibrate_target_from_samples_rejects_confuser_leakage():
+    from bot.vision.calibration import calibrate_target_from_samples
+
+    geo_verifier = GeometryVerifier(canonical_size=(64, 64))
+    onnx_verifier = ONNXVerifier(model_path=MODEL_PATH, canonical_size=(64, 64))
+
+    pos_1 = make_glyph_image("CHECK")
+    pos_2 = make_glyph_image("PLUS")
+    shared_confuser = make_glyph_image("CROSS")
+
+    # Confusers are identical across calib and val partitions: [shared_confuser, shared_confuser]
+    with pytest.raises(CalibrationOverlapError) as exc_info:
+        calibrate_target_from_samples(
+            target_id="target_1",
+            target_reference_img=pos_1,
+            positive_images=[pos_1, pos_2],
+            negative_images=[shared_confuser, shared_confuser],
+            alternative_identity_imgs={"confuser": shared_confuser},
+            geo_verifier=geo_verifier,
+            onnx_verifier=onnx_verifier
+        )
+
+    assert "DATA_LEAKAGE_DETECTED" in str(exc_info.value)
+    assert "Confuser validation partition" in str(exc_info.value)
+
+
+
+
 def test_tri_condition_authority_rejects_different_symbol_with_same_color():
     """
     Core Invariant: Symbol/Geometry is the mandatory authority.

@@ -131,6 +131,70 @@ class CDPActionBackend(BaseActionBackend):
         self.ws_url = ws_url
         return True, "CDP_SUPPORTED_BACKGROUND"
 
+    def invalidate_surface_context(self, reason: str = "context_invalidated") -> None:
+        """
+        Invalidates the bound ViewportContext due to window movement, resize, or DPR change.
+        """
+        logger.warning(f"CDPActionBackend ViewportContext invalidated: {reason}")
+        self.viewport_context = None
+
+    def verify_viewport_freshness(self, ctx: Optional[ViewportContext] = None) -> Tuple[bool, str]:
+        """
+        Verifies that target Chrome window/tab geometry and DPR have not drifted from ctx.
+        If ctx is None, evaluates against self.viewport_context.
+        Returns (True, 'FRESH') or (False, reason) and invalidates cached context on drift.
+        """
+        target_ctx = ctx or self.viewport_context
+        if target_ctx is None:
+            return False, "NO_VIEWPORT_CONTEXT_BOUND"
+
+        ws_url = self.ws_url or self._get_page_ws_url()
+        if not ws_url:
+            self.invalidate_surface_context("CDP_DISCONNECTED")
+            return False, "CDP_DISCONNECTED"
+
+        try:
+            async def _query_geom():
+                async with websockets.connect(ws_url, close_timeout=1.5) as ws:
+                    script = """
+                    (() => {
+                        const dpr = window.devicePixelRatio || 1.0;
+                        const w = window.innerWidth;
+                        const h = window.innerHeight;
+                        return { dpr: dpr, innerWidth: w, innerHeight: h };
+                    })()
+                    """
+                    msg = {"id": 9001, "method": "Runtime.evaluate", "params": {"expression": script, "returnByValue": True}}
+                    await ws.send(json.dumps(msg))
+                    raw = await asyncio.wait_for(ws.recv(), timeout=1.5)
+                    res = json.loads(raw)
+                    return res.get("result", {}).get("result", {}).get("value", {})
+
+            current = asyncio.run(_query_geom())
+            if not current:
+                self.invalidate_surface_context("FAILED_TO_READ_GEOMETRY")
+                return False, "FAILED_TO_READ_GEOMETRY"
+
+            curr_dpr = float(current.get("dpr", 1.0))
+            curr_w = int(current.get("innerWidth", 0))
+            curr_h = int(current.get("innerHeight", 0))
+
+            if abs(curr_dpr - target_ctx.device_pixel_ratio) > 1e-4:
+                reason = f"DPR_DRIFT: recorded={target_ctx.device_pixel_ratio}, current={curr_dpr}"
+                self.invalidate_surface_context(reason)
+                return False, reason
+
+            if int(round(target_ctx.inner_width)) != curr_w or int(round(target_ctx.inner_height)) != curr_h:
+                reason = f"VIEWPORT_RESIZED: recorded={int(round(target_ctx.inner_width))}x{int(round(target_ctx.inner_height))}, current={curr_w}x{curr_h}"
+                self.invalidate_surface_context(reason)
+                return False, reason
+
+            return True, "FRESH"
+        except Exception as e:
+            reason = f"GEOMETRY_FRESHNESS_CHECK_ERROR: {e}"
+            self.invalidate_surface_context(reason)
+            return False, reason
+
     def dispatch_click(
         self,
         screen_x: int,
@@ -156,6 +220,16 @@ class CDPActionBackend(BaseActionBackend):
             if not self.ws_url:
                 logger.error("Cannot dispatch click: CDP WebSocket URL is unavailable.")
                 return ActionDispatchResult(ActionDispatchStatus.NOT_SENT, "CDP WebSocket URL is unavailable", target_screen_pt=(screen_x, screen_y))
+
+        if context.get("verify_freshness", False) and viewport_ctx is not None:
+            is_fresh, fresh_err = self.verify_viewport_freshness(viewport_ctx)
+            if not is_fresh:
+                logger.error(f"Production CDP dispatch rejected: Geometry freshness verification failed: {fresh_err}")
+                return ActionDispatchResult(
+                    ActionDispatchStatus.FAIL_CLOSED,
+                    f"CDP_GEOMETRY_STALE: {fresh_err}",
+                    target_screen_pt=(screen_x, screen_y)
+                )
 
         if viewport_ctx:
             css_x, css_y = CoordinateMapper.screen_to_css_pixels(screen_x, screen_y, viewport_ctx)

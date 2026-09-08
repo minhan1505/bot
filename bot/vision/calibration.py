@@ -36,6 +36,7 @@ class EvaluationSample:
     label: str               # target_id or negative identifier
     session_id: str          # for group-wise split verification
     device_id: str           # device identifier
+    run_id: str = ""         # capture run identifier
 
 
 class CalibrationEngine:
@@ -79,6 +80,16 @@ class CalibrationEngine:
             raise CalibrationOverlapError(
                 f"DATA_LEAKAGE_DETECTED: Sessions {overlap_sessions} are present in both D_calib and D_val. "
                 f"Calibration and validation sets must originate from distinct capture sessions."
+            )
+
+        # Enforce disjoint run split if run IDs provided
+        calib_runs = {s.run_id for s in d_calib if s.run_id}
+        val_runs = {s.run_id for s in d_val if s.run_id}
+        if calib_runs and val_runs and not calib_runs.isdisjoint(val_runs):
+            overlap_runs = calib_runs.intersection(val_runs)
+            raise CalibrationOverlapError(
+                f"DATA_LEAKAGE_DETECTED: Capture runs {overlap_runs} are present in both D_calib and D_val. "
+                f"Calibration and validation sets must originate from distinct capture runs."
             )
 
         # Enforce non-empty competitor set for Identity Margin gate
@@ -280,22 +291,55 @@ def calibrate_target_from_samples(
                 "Calibration requires genuinely independent capture samples."
             )
 
+    neg_calib_hashes = {hashlib.sha256(img.tobytes()).hexdigest() for img in neg_calib}
+    for img in neg_val:
+        if hashlib.sha256(img.tobytes()).hexdigest() in neg_calib_hashes:
+            raise CalibrationOverlapError(
+                "DATA_LEAKAGE_DETECTED: Confuser validation partition contains samples identical to calibration partition."
+            )
+
     d_calib = [
-        EvaluationSample(image=img, is_positive=True, label=target_id, session_id="session_A", device_id="dev_0")
+        EvaluationSample(image=img, is_positive=True, label=target_id, session_id="session_A", device_id="dev_0", run_id="run_A")
         for img in pos_calib
     ] + [
-        EvaluationSample(image=img, is_positive=False, label="negative", session_id="session_A", device_id="dev_0")
+        EvaluationSample(image=img, is_positive=False, label="negative", session_id="session_A", device_id="dev_0", run_id="run_A")
         for img in neg_calib
     ]
 
     d_val = [
-        EvaluationSample(image=img, is_positive=True, label=target_id, session_id="session_B", device_id="dev_0")
+        EvaluationSample(image=img, is_positive=True, label=target_id, session_id="session_B", device_id="dev_1", run_id="run_B")
         for img in pos_val
     ] + [
-        EvaluationSample(image=img, is_positive=False, label="negative", session_id="session_B", device_id="dev_0")
+        EvaluationSample(image=img, is_positive=False, label="negative", session_id="session_B", device_id="dev_1", run_id="run_B")
         for img in neg_val
     ]
 
+    return calibrate_target_from_partitions(
+        target_id=target_id,
+        target_reference_img=target_reference_img,
+        d_calib=d_calib,
+        d_val=d_val,
+        alternative_identity_imgs=alternative_identity_imgs,
+        geo_verifier=geo_verifier,
+        onnx_verifier=onnx_verifier,
+        canonical_size=canonical_size
+    )
+
+
+def calibrate_target_from_partitions(
+    target_id: str,
+    target_reference_img: np.ndarray,
+    d_calib: List[EvaluationSample],
+    d_val: List[EvaluationSample],
+    alternative_identity_imgs: Optional[Dict[str, np.ndarray]],
+    geo_verifier: GeometryVerifier,
+    onnx_verifier: ONNXVerifier,
+    canonical_size: Tuple[int, int] = (64, 64)
+) -> CalibrationProfile:
+    """
+    Executes calibration on explicitly partitioned D_calib and D_val with explicit provenance metadata.
+    Enforces group-wise session/run independence without synthetic fabrication.
+    """
     engine = CalibrationEngine(geometry_verifier=geo_verifier, onnx_verifier=onnx_verifier, canonical_size=canonical_size)
     return engine.calibrate_target(
         target_id=target_id,

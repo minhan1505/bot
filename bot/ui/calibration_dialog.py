@@ -20,7 +20,7 @@ import logging
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QFileDialog, QMessageBox, QGroupBox, QFormLayout, QTableWidget,
-    QTableWidgetItem, QHeaderView, QTabWidget, QWidget
+    QTableWidgetItem, QHeaderView, QTabWidget, QWidget, QLineEdit
 )
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QPixmap, QImage, QColor
@@ -155,6 +155,20 @@ class TargetCalibrationDialog(QDialog):
     def _create_session_tab(self, session_key: str) -> QWidget:
         widget = QWidget()
         layout = QVBoxLayout(widget)
+
+        # Provenance Metadata
+        grp_prov = QGroupBox(f"Capture Provenance Metadata (Session {session_key})")
+        prov_layout = QFormLayout(grp_prov)
+        txt_session = QLineEdit(f"session_{session_key}")
+        txt_device = QLineEdit("dev_0" if session_key == "A" else "dev_1")
+        txt_run = QLineEdit(f"run_{session_key}")
+        setattr(self, f"txt_session_{session_key.lower()}", txt_session)
+        setattr(self, f"txt_device_{session_key.lower()}", txt_device)
+        setattr(self, f"txt_run_{session_key.lower()}", txt_run)
+        prov_layout.addRow("Session ID:", txt_session)
+        prov_layout.addRow("Device ID:", txt_device)
+        prov_layout.addRow("Run ID:", txt_run)
+        layout.addWidget(grp_prov)
 
         # Positive Samples
         lbl_pos = QLabel(f"Real Positive Samples for Session {session_key} (Must be real captures of this target):")
@@ -399,6 +413,39 @@ class TargetCalibrationDialog(QDialog):
                 )
                 return
 
+        # Validate group-wise provenance metadata
+        txt_sess_a = getattr(self, "txt_session_a", None)
+        txt_sess_b = getattr(self, "txt_session_b", None)
+        txt_dev_a = getattr(self, "txt_device_a", None)
+        txt_dev_b = getattr(self, "txt_device_b", None)
+        txt_r_a = getattr(self, "txt_run_a", None)
+        txt_r_b = getattr(self, "txt_run_b", None)
+
+        session_a_id = (txt_sess_a.text().strip() if txt_sess_a else "") or "session_A"
+        session_b_id = (txt_sess_b.text().strip() if txt_sess_b else "") or "session_B"
+        device_a_id = (txt_dev_a.text().strip() if txt_dev_a else "") or "dev_0"
+        device_b_id = (txt_dev_b.text().strip() if txt_dev_b else "") or "dev_1"
+        run_a_id = (txt_r_a.text().strip() if txt_r_a else "") or "run_A"
+        run_b_id = (txt_r_b.text().strip() if txt_r_b else "") or "run_B"
+
+        if session_a_id == session_b_id:
+            QMessageBox.critical(
+                self,
+                "DATA_LEAKAGE_DETECTED",
+                f"Data leakage detected: Session IDs must be distinct for group-wise independence.\n"
+                f"Session A: '{session_a_id}', Session B: '{session_b_id}'"
+            )
+            return
+
+        if run_a_id and run_b_id and run_a_id == run_b_id:
+            QMessageBox.critical(
+                self,
+                "DATA_LEAKAGE_DETECTED",
+                f"Data leakage detected: Run IDs must be distinct across calibration and validation partitions.\n"
+                f"Run A: '{run_a_id}', Run B: '{run_b_id}'"
+            )
+            return
+
         ref_img = pos_a_imgs[0]
 
         # Construct competitor alternative targets dictionary
@@ -406,35 +453,34 @@ class TargetCalibrationDialog(QDialog):
         for idx, img in enumerate(neg_a_imgs + neg_b_imgs):
             alt_imgs[f"confuser_{idx}"] = img
 
-        # Construct genuine, partitioned evaluation samples
+        # Construct genuine, partitioned evaluation samples with verified provenance
         d_calib = [
-            EvaluationSample(image=img, is_positive=True, label=self.target.target_id, session_id="session_A", device_id="dev_0")
+            EvaluationSample(image=img, is_positive=True, label=self.target.target_id, session_id=session_a_id, device_id=device_a_id, run_id=run_a_id)
             for img in pos_a_imgs
         ] + [
-            EvaluationSample(image=img, is_positive=False, label="confuser", session_id="session_A", device_id="dev_0")
+            EvaluationSample(image=img, is_positive=False, label="confuser", session_id=session_a_id, device_id=device_a_id, run_id=run_a_id)
             for img in neg_a_imgs
         ]
 
         d_val = [
-            EvaluationSample(image=img, is_positive=True, label=self.target.target_id, session_id="session_B", device_id="dev_0")
+            EvaluationSample(image=img, is_positive=True, label=self.target.target_id, session_id=session_b_id, device_id=device_b_id, run_id=run_b_id)
             for img in pos_b_imgs
         ] + [
-            EvaluationSample(image=img, is_positive=False, label="confuser", session_id="session_B", device_id="dev_0")
+            EvaluationSample(image=img, is_positive=False, label="confuser", session_id=session_b_id, device_id=device_b_id, run_id=run_b_id)
             for img in neg_b_imgs
         ]
 
         try:
-            engine = CalibrationEngine(
-                geometry_verifier=self.geo_verifier,
-                onnx_verifier=self.onnx_verifier,
-                canonical_size=(64, 64)
-            )
-            calib_result = engine.calibrate_target(
+            from bot.vision.calibration import calibrate_target_from_partitions
+            calib_result = calibrate_target_from_partitions(
                 target_id=self.target.target_id,
                 target_reference_img=ref_img,
                 d_calib=d_calib,
                 d_val=d_val,
-                alternative_identity_imgs=alt_imgs
+                alternative_identity_imgs=alt_imgs,
+                geo_verifier=self.geo_verifier,
+                onnx_verifier=self.onnx_verifier,
+                canonical_size=(64, 64)
             )
 
             self.calibrated_profile = calib_result

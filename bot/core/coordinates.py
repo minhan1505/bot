@@ -136,12 +136,27 @@ class CoordinateMapper:
         view_x = client_x - ctx.viewport_offset[0]
         view_y = client_y - ctx.viewport_offset[1]
 
-        # Step 3: Viewport Physical Pixels -> CSS Pixels via devicePixelRatio
+        # Step 3: Viewport Physical Pixels -> Viewport CSS Pixels via devicePixelRatio
+        # Note: CDP Input.dispatchMouseEvent requires coordinates relative to the main frame's
+        # visible viewport in CSS pixels (clientX, clientY). Document scroll_offset must NOT shift
+        # viewport dispatch coordinates.
         dpr = max(0.1, ctx.device_pixel_ratio)
-        css_x = (view_x / dpr) + ctx.scroll_offset[0]
-        css_y = (view_y / dpr) + ctx.scroll_offset[1]
+        css_x = view_x / dpr
+        css_y = view_y / dpr
 
         return (css_x, css_y)
+
+    @staticmethod
+    def screen_to_document_css_pixels(
+        screen_x: int,
+        screen_y: int,
+        ctx: ViewportContext
+    ) -> Tuple[float, float]:
+        """
+        Converts Physical Screen Pixels to Document-Relative CSS Pixels (including page scroll).
+        """
+        css_x, css_y = CoordinateMapper.screen_to_css_pixels(screen_x, screen_y, ctx)
+        return (css_x + ctx.scroll_offset[0], css_y + ctx.scroll_offset[1])
 
     @staticmethod
     def region_normalized_to_css_pixels(
