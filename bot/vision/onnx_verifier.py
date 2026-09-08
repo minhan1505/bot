@@ -125,11 +125,18 @@ class ONNXVerifier:
 
     def compute_embeddings(self, images: List[np.ndarray]) -> np.ndarray:
         """
-        Computes L2-normalized feature embeddings for a batch of images.
+        Computes L2-normalized feature embeddings for a batch of images (U07).
+        Safely chunks batches larger than 64 to prevent memory spikes.
         Returns np.ndarray of shape [B, D].
         """
         if not images:
             return np.empty((0, self.native_embedding_dim), dtype=np.float32)
+
+        if len(images) > 64:
+            chunk_embs = []
+            for i in range(0, len(images), 64):
+                chunk_embs.append(self.compute_embeddings(images[i:i + 64]))
+            return np.vstack(chunk_embs)
 
         batch_tensors = [self.letterbox_preprocess(img, self.canonical_size) for img in images]
         batch_input = np.stack(batch_tensors, axis=0).astype(np.float32)
@@ -146,9 +153,17 @@ class ONNXVerifier:
 
         return normalized_embeddings
 
+    @staticmethod
+    def _compute_images_hash(images: List[np.ndarray]) -> str:
+        h = hashlib.sha256()
+        for img in images:
+            h.update(img.tobytes())
+        return h.hexdigest()[:16]
+
     def cache_target_embedding(self, target_id: str, reference_images: List[np.ndarray]):
         """
         Encodes and caches mean target embedding across all provided reference image variations.
+        Keys embedding by target_id and content hash to prevent cross-profile contamination.
         """
         if not reference_images:
             raise ValueError(f"No reference images provided for target {target_id}")
@@ -158,11 +173,33 @@ class ONNXVerifier:
         mean_emb = np.mean(embs, axis=0, keepdims=True)
         norm = np.linalg.norm(mean_emb)
         norm = max(norm, 1e-8)
-        self._target_cache[target_id] = (mean_emb / norm).flatten()
-        logger.info(f"Cached embedding for target '{target_id}' (averaged across {len(reference_images)} references).")
+        normed = (mean_emb / norm).flatten()
+        img_hash = self._compute_images_hash(reference_images)
+        self._target_cache[target_id] = (img_hash, normed)
+        logger.info(f"Cached embedding for target '{target_id}' [hash: {img_hash}] (averaged across {len(reference_images)} references).")
 
-    def get_cached_target_embedding(self, target_id: str) -> Optional[np.ndarray]:
-        return self._target_cache.get(target_id)
+    def get_cached_target_embedding(
+        self,
+        target_id: str,
+        reference_images: Optional[List[np.ndarray]] = None
+    ) -> Optional[np.ndarray]:
+        entry = self._target_cache.get(target_id)
+        if entry is None:
+            return None
+        if isinstance(entry, tuple):
+            cached_hash, emb = entry
+            if reference_images is not None:
+                current_hash = self._compute_images_hash(reference_images)
+                if current_hash != cached_hash:
+                    logger.debug(f"Target cache miss for '{target_id}': content changed ({cached_hash} != {current_hash})")
+                    return None
+            return emb
+        return entry
+
+    def clear_target_cache(self):
+        """Clears target embedding cache (e.g. on profile switch)."""
+        self._target_cache.clear()
+        logger.debug("Cleared target embedding cache.")
 
     @staticmethod
     def cosine_similarity(v1: np.ndarray, v2: np.ndarray) -> float:

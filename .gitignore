@@ -55,8 +55,9 @@ cover/
 logs/*.jsonl
 logs/*.log
 
-# Runtime generated license files
-license.dat
+# Runtime generated data files
+data/benchmark_targets/
+data/evidence/
 
 # IDEs
 .vscode/

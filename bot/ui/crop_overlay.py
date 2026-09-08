@@ -84,11 +84,13 @@ class ScreenCropOverlay(QWidget):
     and allows rubberband rectangle selection.
     """
     target_cropped = Signal(np.ndarray) # Emits cropped BGR numpy array
+    region_selected = Signal(int, int, int, int) # Emits (x, y, w, h) for ROI selection
 
-    def __init__(self, physical_frame: np.ndarray, desktop_offset: Tuple[int, int] = (0, 0)):
+    def __init__(self, physical_frame: np.ndarray, desktop_offset: Tuple[int, int] = (0, 0), mode: str = "target"):
         super().__init__()
         self.physical_frame = physical_frame
         self.desktop_offset = desktop_offset
+        self.mode = mode
         self.origin = QPoint()
         self.rubber_band = QRubberBand(QRubberBand.Rectangle, self)
 
@@ -128,7 +130,10 @@ class ScreenCropOverlay(QWidget):
                 w = min(rect.width(), self.physical_frame.shape[1] - x)
                 h = min(rect.height(), self.physical_frame.shape[0] - y)
 
-                crop = self.physical_frame[y:y + h, x:x + w].copy()
-                preview = CropPreviewDialog(crop)
-                if preview.exec() == QDialog.Accepted and preview.accepted_crop:
-                    self.target_cropped.emit(crop)
+                if self.mode == "region":
+                    self.region_selected.emit(x, y, w, h)
+                else:
+                    crop = self.physical_frame[y:y + h, x:x + w].copy()
+                    preview = CropPreviewDialog(crop)
+                    if preview.exec() == QDialog.Accepted and preview.accepted_crop:
+                        self.target_cropped.emit(crop)

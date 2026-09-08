@@ -48,42 +48,44 @@ class SessionLedger:
     ) -> Optional[str]:
         """
         Associates a detected screen coordinate (screen_x, screen_y) with its owner Region.
-        Candidate must strictly lie inside the region's physical rect and the region
-        must be waiting for this exact target_id.
+        Enforces strict fail-closed identity:
+        - If candidate_region_id is specified: only validates that exact region. Never falls back.
+        - If candidate_region_id is None: searches active regions; rejects if ambiguous (>1 overlap).
         """
-        # If candidate_region_id not provided directly, inspect caller's local variables
-        if candidate_region_id is None:
-            try:
-                import inspect
-                frame = inspect.currentframe().f_back
-                if frame:
-                    if "candidate_region_id" in frame.f_locals:
-                        candidate_region_id = frame.f_locals["candidate_region_id"]
-                    elif "r_id" in frame.f_locals:
-                        candidate_region_id = frame.f_locals["r_id"]
-                    elif "region_id" in frame.f_locals:
-                        candidate_region_id = frame.f_locals["region_id"]
-            except Exception:
-                pass
+        # Strict explicit identity branch
+        if candidate_region_id is not None:
+            cfg = self._regions_config.get(candidate_region_id)
+            if not cfg:
+                logger.debug(f"Candidate region '{candidate_region_id}' does not exist in ledger")
+                return None
 
-        # If a candidate region was specified/identified, prioritize it first
-        if candidate_region_id and candidate_region_id in self._regions_config:
-            cfg = self._regions_config[candidate_region_id]
             r_rect = Rect(cfg.x, cfg.y, cfg.w, cfg.h)
-            if r_rect.contains(screen_x, screen_y):
-                inst = self._instances.get(candidate_region_id)
-                if inst and inst.state == RegionState.WAIT_STEP and inst.expected_target_id == target_id:
-                    return candidate_region_id
+            if not r_rect.contains(screen_x, screen_y):
+                logger.debug(f"Coordinate ({screen_x}, {screen_y}) is outside Region '{candidate_region_id}' rect")
+                return None
 
-        # Fallback to general search across regions
+            inst = self._instances.get(candidate_region_id)
+            if not inst or inst.state != RegionState.WAIT_STEP or inst.expected_target_id != target_id:
+                logger.debug(f"Region '{candidate_region_id}' state is not WAIT_STEP for target '{target_id}'")
+                return None
+
+            return candidate_region_id
+
+        # Global unassigned scan branch: reject if ambiguous
+        matching_regions = []
         for r_id, cfg in self._regions_config.items():
             r_rect = Rect(cfg.x, cfg.y, cfg.w, cfg.h)
             if r_rect.contains(screen_x, screen_y):
                 inst = self._instances.get(r_id)
                 if inst and inst.state == RegionState.WAIT_STEP and inst.expected_target_id == target_id:
-                    return r_id
-                else:
-                    logger.debug(f"Candidate at ({screen_x}, {screen_y}) is inside Region {r_id}, but region state is {inst.state if inst else 'NONE'}")
+                    matching_regions.append(r_id)
+
+        if len(matching_regions) == 1:
+            return matching_regions[0]
+        elif len(matching_regions) > 1:
+            logger.warning(f"Ambiguity conflict: candidate at ({screen_x}, {screen_y}) overlaps multiple regions: {matching_regions} -> REJECT")
+            return None
+
         return None
 
     def advance_region(self, region_id: str):

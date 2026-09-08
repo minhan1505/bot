@@ -81,7 +81,7 @@ class CandidateProposalEngine:
     def __init__(
         self,
         k_base_per_region: int = 4,
-        max_batch_limit: int = 32,
+        max_batch_limit: int = 128,
         scales: Tuple[float, ...] = (0.85, 1.0, 1.15)
     ):
         self.k_base = k_base_per_region
@@ -235,8 +235,9 @@ class CandidateProposalEngine:
 
         for r_id, props in proposals_by_region.items():
             if len(props) > self.k_base:
-                # Region has overflow
-                diagnostics[r_id] = f"PROPOSAL_OVERFLOW(count={len(props)}, capped_to={self.k_base})"
+                # Region has overflow where candidates had to be truncated.
+                # U07 Invariant: Recall cannot be guaranteed for truncated region!
+                diagnostics[r_id] = f"PROPOSAL_OVERFLOW_UNGUARANTEED_RECALL(count={len(props)}, capped_to={self.k_base})"
                 # Sort by proposal score and take top K_base
                 sorted_props = sorted(props, key=lambda p: p.score, reverse=True)
                 final_list.extend(sorted_props[:self.k_base])
@@ -247,7 +248,19 @@ class CandidateProposalEngine:
 
         # Global safety truncation if still exceeds batch limit
         if len(final_list) > self.max_batch_limit:
-            final_list = sorted(final_list, key=lambda p: p.score, reverse=True)[:self.max_batch_limit]
+            sorted_all = sorted(final_list, key=lambda p: p.score, reverse=True)
+            kept_props = sorted_all[:self.max_batch_limit]
+            dropped_props = sorted_all[self.max_batch_limit:]
+
+            dropped_by_region: Dict[str, int] = {}
+            for dp in dropped_props:
+                dropped_by_region[dp.region_id] = dropped_by_region.get(dp.region_id, 0) + 1
+
+            for r_id, drop_count in dropped_by_region.items():
+                prior_diag = diagnostics.get(r_id, "NORMAL_OK")
+                diagnostics[r_id] = f"PROPOSAL_OVERFLOW_GLOBAL_TRUNCATION(dropped={drop_count}, prior={prior_diag})"
+
+            final_list = kept_props
 
         return final_list, diagnostics
 

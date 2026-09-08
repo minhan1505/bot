@@ -8,9 +8,12 @@ Executes the unified live pipeline:
 Runs on a background thread to ensure GUI remains 100% responsive.
 """
 
+from __future__ import annotations
+import os
+import cv2
 import time
 import threading
-from typing import Dict, Optional, Callable, List
+from typing import Dict, Optional, Callable, List, Tuple, Any, Union
 import numpy as np
 import logging
 
@@ -21,6 +24,7 @@ from bot.vision.engine import VisionEngine
 from bot.workflow.ledger import SessionLedger
 from bot.workflow.scheduler import TwoTierScheduler
 from bot.workflow.state_machine import RegionState
+from bot.action.base import ActionDispatchResult, ActionDispatchStatus
 from bot.action.manager import ActionManager
 from bot.telemetry.logger import AsyncTelemetryLogger
 
@@ -41,8 +45,11 @@ class BotRuntimeRunner:
         ledger: SessionLedger,
         telemetry_logger: Optional[AsyncTelemetryLogger] = None,
         is_dry_run: bool = False,
+        is_production: bool = False,
+        is_shadow: bool = False,
         on_decision_callback: Optional[Callable[[DecisionResult], None]] = None,
-        on_state_callback: Optional[Callable[[str, str, int], None]] = None
+        on_state_callback: Optional[Callable[[str, str, int], None]] = None,
+        on_shadow_evidence_callback: Optional[Callable[[dict], None]] = None
     ):
         self.profile = profile
         self.capture_manager = capture_manager
@@ -51,23 +58,28 @@ class BotRuntimeRunner:
         self.ledger = ledger
         self.telemetry = telemetry_logger
         self.is_dry_run = is_dry_run
+        self.is_production = is_production
+        self.is_shadow = is_shadow
         self.on_decision = on_decision_callback
         self.on_state_change = on_state_callback
+        self.on_shadow_evidence = on_shadow_evidence_callback
 
         self.scheduler = TwoTierScheduler(tier2_group_count=3)
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
         self._session_id = f"session_{int(time.time())}"
+        self._start_time = 0.0
         self.total_evaluations = 0
         self.total_matches = 0
 
     def start(self):
         """Starts real-time background worker loop."""
         self._stop_event.clear()
+        self._start_time = time.time()
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
-        logger.info(f"BotRuntimeRunner started (Session: {self._session_id}, DryRun={self.is_dry_run})")
+        logger.info(f"BotRuntimeRunner started (Session: {self._session_id}, DryRun={self.is_dry_run}, Shadow={self.is_shadow})")
 
     def stop(self):
         """Stops background worker cleanly."""
@@ -81,10 +93,37 @@ class BotRuntimeRunner:
     def is_running(self) -> bool:
         return self._thread is not None and self._thread.is_alive() and not self._stop_event.is_set()
 
+    def _save_evidence_crop_async(self, frame: np.ndarray, rect: Tuple[int, int, int, int], res: DecisionResult):
+        """Saves candidate crop asynchronously to evidence directory without blocking (FC-11)."""
+        def _worker():
+            try:
+                x, y, w, h = rect
+                h_f, w_f = frame.shape[:2]
+                x1, y1 = max(0, min(x, w_f)), max(0, min(y, h_f))
+                x2, y2 = max(x1, min(x + w, w_f)), max(y1, min(y + h, h_f))
+                if x2 - x1 < 4 or y2 - y1 < 4:
+                    return
+                crop = frame[y1:y2, x1:x2].copy()
+                evidence_dir = os.path.abspath("data/evidence")
+                os.makedirs(evidence_dir, exist_ok=True)
+                fname = f"{int(time.time() * 1000)}_{res.target_id}_{res.decision.value}.png"
+                cv2.imwrite(os.path.join(evidence_dir, fname), crop)
+            except Exception:
+                pass
+        threading.Thread(target=_worker, daemon=True).start()
+
     def _run_loop(self):
         scan_interval_sec = max(0.005, self.profile.scan_interval_ms / 1000.0)
 
         while not self._stop_event.is_set():
+            # Check profile auto-stop limit (FC-10)
+            if self.profile.safety_config and self.profile.safety_config.auto_stop_minutes > 0:
+                elapsed_min = (time.time() - self._start_time) / 60.0
+                if elapsed_min >= self.profile.safety_config.auto_stop_minutes:
+                    logger.critical(f"AUTO_STOP_LIMIT_REACHED: Profile duration limit ({self.profile.safety_config.auto_stop_minutes}m) exceeded. Stopping runner.")
+                    self._stop_event.set()
+                    break
+
             t_cycle_start = time.perf_counter()
 
             # 1. Capture screen frame
@@ -114,13 +153,17 @@ class BotRuntimeRunner:
                 target_cfg = self.profile.targets.get(target_id)
                 region_cfg = self.profile.regions.get(r_id)
 
-                if not target_cfg or not region_cfg or not target_cfg.reference_image_paths:
+                if not target_cfg or not getattr(target_cfg, "enabled", True) or not region_cfg or not target_cfg.reference_image_paths:
                     continue
 
-                # Read reference image
+                # Read all reference images for target (U05)
                 import cv2
-                ref_img = cv2.imread(target_cfg.reference_image_paths[0])
-                if ref_img is None:
+                ref_imgs = []
+                for p in target_cfg.reference_image_paths:
+                    img = cv2.imread(p)
+                    if img is not None:
+                        ref_imgs.append(img)
+                if not ref_imgs:
                     continue
 
                 r_rect = Rect(region_cfg.x, region_cfg.y, region_cfg.w, region_cfg.h)
@@ -134,9 +177,15 @@ class BotRuntimeRunner:
                     continue
 
                 region_crop = frame[ry1:ry2, rx1:rx2]
-                props = self.vision_engine.proposal_engine.generate_proposals_for_region(
-                    region_crop, r_rect, ref_img, r_id
-                )
+                props = []
+                for p_ref_img in ref_imgs:
+                    sub_p = self.vision_engine.proposal_engine.generate_proposals_for_region(
+                        region_crop, r_rect, p_ref_img, r_id
+                    )
+                    props.extend(sub_p)
+                if len(ref_imgs) > 1:
+                    from bot.vision.proposal import nms
+                    props = nms(props, iou_threshold=0.35)
                 if props:
                     proposals_by_region[r_id] = props
 
@@ -149,20 +198,107 @@ class BotRuntimeRunner:
                 for r_id, expected_target_id in scheduled_regions:
                     region_candidates = [c for c in candidates if c.region_id == r_id]
                     if not region_candidates:
+                        r_diag = diag.get(r_id, "")
+                        if "PROPOSAL_OVERFLOW" in r_diag:
+                            fault_res = DecisionResult(
+                                target_id=expected_target_id,
+                                region_id=r_id,
+                                candidate_rect=(0, 0, 0, 0),
+                                geometry_score=0.0,
+                                geometry_pass=False,
+                                embedding_similarity=0.0,
+                                embedding_pass=False,
+                                identity_margin=0.0,
+                                margin_pass=False,
+                                decision=DecisionClass.UNKNOWN,
+                                reason=f"PROPOSAL_OVERFLOW_PERFORMANCE_FAULT: proposals in region '{r_id}' truncated ({r_diag}). Recall cannot be guaranteed.",
+                                timestamp=time.time()
+                            )
+                            if self.on_decision:
+                                self.on_decision(fault_res)
                         continue
 
                     target_cfg = self.profile.targets.get(expected_target_id)
-                    if not target_cfg or not target_cfg.reference_image_paths:
+                    if not target_cfg or not getattr(target_cfg, "enabled", True) or not target_cfg.reference_image_paths:
                         continue
 
                     import cv2
-                    ref_img = cv2.imread(target_cfg.reference_image_paths[0])
-                    if ref_img is None:
+                    ref_imgs = []
+                    for p in target_cfg.reference_image_paths:
+                        img = cv2.imread(p)
+                        if img is not None:
+                            ref_imgs.append(img)
+                    if not ref_imgs:
                         continue
 
-                    decisions = self.vision_engine.evaluate_candidates(
-                        frame, region_candidates, target_cfg, ref_img
-                    )
+                    # Collect competitor targets for Gate 3 Margin evaluation (U05/W04: all references + explicit confusers)
+                    alt_targets: Dict[str, List[np.ndarray]] = {}
+                    for other_id, other_cfg in self.profile.targets.items():
+                        if other_id != expected_target_id and other_cfg.reference_image_paths:
+                            other_imgs = []
+                            for p in other_cfg.reference_image_paths:
+                                img = cv2.imread(p)
+                                if img is not None:
+                                    other_imgs.append(img)
+                            if other_imgs:
+                                alt_targets[other_id] = other_imgs
+
+                    # W04: Include explicit target confusers in initial Gate-3 competitor set
+                    if target_cfg.confuser_image_paths:
+                        for c_idx, c_path in enumerate(target_cfg.confuser_image_paths):
+                            c_img = cv2.imread(c_path)
+                            if c_img is not None:
+                                alt_targets[f"{expected_target_id}_confuser_{c_idx}"] = [c_img]
+
+                    try:
+                        decisions = self.vision_engine.evaluate_candidates(
+                            frame, region_candidates, target_cfg, ref_imgs, alt_targets
+                        )
+                    except ValueError as calib_err:
+                        if "CALIBRATION_INVALID" in str(calib_err):
+                            logger.error(f"Region {r_id}: Calibration invalid for target '{expected_target_id}': {calib_err}")
+                            fault_res = DecisionResult(
+                                target_id=expected_target_id,
+                                region_id=r_id,
+                                candidate_rect=(0, 0, 0, 0),
+                                geometry_score=0.0,
+                                geometry_pass=False,
+                                embedding_similarity=0.0,
+                                embedding_pass=False,
+                                identity_margin=0.0,
+                                margin_pass=False,
+                                decision=DecisionClass.UNKNOWN,
+                                reason=f"CALIBRATION_INVALID: {calib_err}",
+                                timestamp=time.time()
+                            )
+                            decisions = [fault_res]
+                            inst = self.ledger.get_instance(r_id)
+                            if inst:
+                                inst.transition_to(RegionState.SAFE_PAUSE, reason=f"CALIBRATION_INVALID: {calib_err}")
+                                if self.on_state_change:
+                                    self.on_state_change(r_id, "SAFE_PAUSE", inst.current_step_index)
+                        else:
+                            raise
+
+                    # U07 Fail-Closed Guard: If proposal overflow occurred in this region and no candidate matched,
+                    # recall cannot be guaranteed; emit PERFORMANCE_FAULT / UNKNOWN.
+                    r_diag = diag.get(r_id, "")
+                    if "PROPOSAL_OVERFLOW" in r_diag and not any(d.decision == DecisionClass.MATCH for d in decisions):
+                        fault_res = DecisionResult(
+                            target_id=expected_target_id,
+                            region_id=r_id,
+                            candidate_rect=(0, 0, 0, 0),
+                            geometry_score=0.0,
+                            geometry_pass=False,
+                            embedding_similarity=0.0,
+                            embedding_pass=False,
+                            identity_margin=0.0,
+                            margin_pass=False,
+                            decision=DecisionClass.UNKNOWN,
+                            reason=f"PROPOSAL_OVERFLOW_PERFORMANCE_FAULT: proposals in region '{r_id}' exceeded quota ({r_diag}). Recall cannot be guaranteed.",
+                            timestamp=time.time()
+                        )
+                        decisions.append(fault_res)
 
                     for res in decisions:
                         self.total_evaluations += 1
@@ -171,6 +307,12 @@ class BotRuntimeRunner:
 
                         if self.telemetry:
                             self.telemetry.log_event("DECISION", res.model_dump())
+
+                        # Save evidence crop if low margin or UNKNOWN/REJECT (FC-11)
+                        if res.decision != DecisionClass.MATCH:
+                            self._save_evidence_crop_async(frame, res.candidate_rect, res)
+                        elif target_cfg.calibration and res.identity_margin < target_cfg.calibration.m_safe * 1.5:
+                            self._save_evidence_crop_async(frame, res.candidate_rect, res)
 
                         if res.decision == DecisionClass.MATCH:
                             self.total_matches += 1
@@ -185,42 +327,328 @@ class BotRuntimeRunner:
                             if owner_region:
                                 inst = self.ledger.get_instance(owner_region)
                                 if inst:
+                                    if inst.state != RegionState.WAIT_STEP:
+                                        continue
+
+                                    snapshot_gen = inst.generation
+                                    snapshot_step = inst.current_step_index
+
                                     inst.on_target_detected(expected_target_id, (cand_cx, cand_cy))
+                                    if inst.state != RegionState.TARGET_DETECTED:
+                                        continue
 
-                                    # Fresh Verify (FR-053): Re-confirm on a fresh sub-ROI
+                                    # Fresh Verify (FR-053): Re-confirm on a fresh sub-ROI with Tri-Gate Authority
                                     sub_rect = Rect(res.candidate_rect[0], res.candidate_rect[1], res.candidate_rect[2], res.candidate_rect[3])
-                                    fresh_crop, _ = self.capture_manager.grab_sub_roi(sub_rect)
+                                    fresh_crop = None
+                                    if hasattr(self.capture_manager, "grab_sub_roi"):
+                                        fresh_crop, _ = self.capture_manager.grab_sub_roi(sub_rect)
 
-                                    if fresh_crop is not None:
-                                        # Fast geometry confirmation on fresh frame
-                                        g_fresh = self.vision_engine.geo_verifier.compute_geometry_score(fresh_crop, ref_img)
-                                        if g_fresh >= (target_cfg.calibration.t_g if target_cfg.calibration else 0.5):
-                                            inst.on_fresh_verified()
+                                    # Invariant Check: Verify generation and step did not change during grab
+                                    if inst.generation != snapshot_gen or inst.current_step_index != snapshot_step:
+                                        logger.warning(f"Region {owner_region}: Stale generation or step changed during fresh verify grab.")
+                                        continue
 
-                                            step = inst.current_step
-                                            if step and step.action_type == ActionType.DETECT_ONLY:
-                                                # DETECT_ONLY: Advance without physical dispatch
-                                                logger.info(f"[DETECT_ONLY] Target '{expected_target_id}' detected for Region {owner_region}")
-                                                inst.on_action_dispatched()
-                                                inst.advance_step()
-                                                if self.on_state_change:
-                                                    self.on_state_change(owner_region, inst.state.value, inst.current_step_index)
-                                            elif not self.is_dry_run:
-                                                dispatched = self.action_manager.dispatch_action(cand_cx, cand_cy, {})
-                                                if dispatched:
-                                                    inst.on_action_dispatched()
-                                                    inst.advance_step()
-                                                    if self.on_state_change:
-                                                        self.on_state_change(owner_region, inst.state.value, inst.current_step_index)
-                                                else:
-                                                    logger.warning(f"Failed to dispatch action for Region {owner_region} - retrying")
-                                                    inst.transition_to(RegionState.WAIT_STEP, reason="Dispatch failed; retrying")
+                                    # Invariant Check: Verify step deadline did not expire during grab
+                                    if inst.is_deadline_expired():
+                                        logger.warning(f"Region {owner_region}: Step deadline expired during fresh verify grab.")
+                                        inst.transition_to(RegionState.TIMEOUT, reason="Step deadline expired during fresh verify grab")
+                                        continue
+
+                                    if fresh_crop is None:
+                                        inst.on_fresh_verify_failed("Sub-ROI crop failed on fresh frame")
+                                        continue
+
+                                    # Fast tri-condition confirmation on fresh frame
+                                    calib = target_cfg.calibration
+                                    if calib is None:
+                                        if self.is_production:
+                                            reason = f"Target '{expected_target_id}' uncalibrated: missing CalibrationProfile in production."
+                                            logger.error(f"Region {owner_region}: {reason}")
+                                            inst.on_fresh_verify_failed(reason)
+                                            continue
+                                        t_g, t_e, m_safe = 0.5, 0.65, 0.05
+                                    else:
+                                        t_g, t_e, m_safe = calib.t_g, calib.t_e, calib.m_safe
+
+                                    g_fresh = 0.0
+                                    geo_fresh_pass = False
+                                    if hasattr(self.vision_engine, "geo_verifier") and self.vision_engine.geo_verifier is not None:
+                                        g_fresh = max(self.vision_engine.geo_verifier.compute_geometry_score(fresh_crop, r) for r in ref_imgs) if ref_imgs else 0.0
+                                        geo_fresh_pass = (g_fresh >= t_g)
+
+                                    emb_fresh_pass = True if not self.is_production else False
+                                    margin_fresh_pass = True if not self.is_production else False
+
+                                    if hasattr(self.vision_engine, "onnx_verifier") and self.vision_engine.onnx_verifier is not None:
+                                        fresh_emb = self.vision_engine.onnx_verifier.compute_embeddings([fresh_crop])[0]
+                                        target_emb = self.vision_engine.onnx_verifier.get_cached_target_embedding(expected_target_id, ref_imgs)
+                                        if target_emb is None:
+                                            self.vision_engine.onnx_verifier.cache_target_embedding(expected_target_id, ref_imgs)
+                                            target_emb = self.vision_engine.onnx_verifier.get_cached_target_embedding(expected_target_id, ref_imgs)
+                                        e_fresh = self.vision_engine.onnx_verifier.cosine_similarity(fresh_emb, target_emb) if target_emb is not None else 0.0
+                                        emb_fresh_pass = (e_fresh >= t_e)
+
+                                        # Collect competitor targets including explicit confusers (normalized to Dict[str, List[np.ndarray]])
+                                        fresh_competitors: Dict[str, List[np.ndarray]] = {}
+                                        if alt_targets:
+                                            for aid, aimgs in alt_targets.items():
+                                                if aimgs:
+                                                    fresh_competitors[aid] = list(aimgs)
+                                        if target_cfg.confuser_image_paths:
+                                            for c_idx, c_path in enumerate(target_cfg.confuser_image_paths):
+                                                c_img = cv2.imread(c_path)
+                                                if c_img is not None:
+                                                    fresh_competitors[f"{expected_target_id}_confuser_{c_idx}"] = [c_img]
+
+                                        if fresh_competitors:
+                                            competitor_scores = []
+                                            for aid, aimgs in fresh_competitors.items():
+                                                if not aimgs:
+                                                    continue
+                                                c_emb = self.vision_engine.onnx_verifier.get_cached_target_embedding(aid, aimgs)
+                                                if c_emb is None:
+                                                    self.vision_engine.onnx_verifier.cache_target_embedding(aid, aimgs)
+                                                    c_emb = self.vision_engine.onnx_verifier.get_cached_target_embedding(aid, aimgs)
+                                                if c_emb is not None:
+                                                    sim = self.vision_engine.onnx_verifier.cosine_similarity(fresh_emb, c_emb)
+                                                    competitor_scores.append(sim)
+
+                                            if competitor_scores:
+                                                best_comp = max(competitor_scores)
+                                                margin_fresh_pass = ((e_fresh - best_comp) >= m_safe)
+                                        else:
+                                            margin_fresh_pass = True if not self.is_production else False
+
+                                    if not (geo_fresh_pass and emb_fresh_pass and margin_fresh_pass):
+                                        reason = f"Fresh verify tri-gate failed: G={g_fresh:.3f}/{t_g} (pass={geo_fresh_pass}), E={e_fresh:.3f}/{t_e} (pass={emb_fresh_pass}), M_pass={margin_fresh_pass}"
+                                        logger.warning(f"Region {owner_region}: {reason}")
+                                        inst.on_fresh_verify_failed(reason)
+                                        continue
+
+                                    # Invariant Check: Verify generation, step, and deadline before moving to VERIFIED
+                                    if inst.generation != snapshot_gen or inst.current_step_index != snapshot_step:
+                                        logger.warning(f"Region {owner_region}: Stale generation or step changed before fresh verification commit.")
+                                        continue
+
+                                    if inst.is_deadline_expired():
+                                        logger.warning(f"Region {owner_region}: Step deadline expired after fresh verify tri-gate.")
+                                        inst.transition_to(RegionState.TIMEOUT, reason="Step deadline expired after fresh verify tri-gate")
+                                        continue
+
+                                    inst.on_fresh_verified()
+                                    if inst.state != RegionState.VERIFIED:
+                                        continue
+
+                                    # Map coordinates with desktop offset
+                                    desktop_offset = (0, 0)
+                                    if hasattr(self.capture_manager, "get_desktop_offset"):
+                                        desktop_offset = self.capture_manager.get_desktop_offset()
+
+                                    screen_x = cand_cx + desktop_offset[0]
+                                    screen_y = cand_cy + desktop_offset[1]
+
+                                    step = inst.current_step
+                                    backend = getattr(self.action_manager, "backend", None)
+                                    action_context = {
+                                        "hwnd": getattr(backend, "hwnd", None),
+                                        "region_id": owner_region,
+                                        "workflow_id": inst.workflow.workflow_id,
+                                        "step_index": inst.current_step_index,
+                                        "generation": inst.generation,
+                                        "timestamp": time.time(),
+                                        "desktop_offset": desktop_offset,
+                                        "viewport_context": getattr(backend, "viewport_context", None),
+                                        "is_production": self.is_production,
+                                        "verify_freshness": self.is_production,
+                                        "action_type": step.action_type if step else ActionType.CLICK,
+                                    }
+
+                                    if step and step.action_type == ActionType.DETECT_ONLY:
+                                        # DETECT_ONLY: Advance without physical dispatch
+                                        logger.info(f"[DETECT_ONLY] Target '{expected_target_id}' detected for Region {owner_region}")
+                                        inst.on_action_dispatched()
+                                        inst.advance_step()
+                                        if self.on_state_change:
+                                            self.on_state_change(owner_region, inst.state.value, inst.current_step_index)
+                                    elif self.is_shadow:
+                                        # FC-09: Shadow Mode dedicated comparison/evidence stream (0 dispatch)
+                                        logger.info(f"[SHADOW-MODE] Predicted match at ({screen_x}, {screen_y}) for Region {owner_region}, step {inst.current_step_index}")
+                                        shadow_data = {
+                                            "event": "SHADOW_COMPARISON",
+                                            "region_id": owner_region,
+                                            "workflow_id": inst.workflow.workflow_id,
+                                            "step_index": inst.current_step_index,
+                                            "target_id": expected_target_id,
+                                            "screen_pos": (screen_x, screen_y),
+                                            "decision": res.decision.value,
+                                            "geometry_score": res.geometry_score,
+                                            "embedding_similarity": res.embedding_similarity,
+                                            "identity_margin": res.identity_margin,
+                                            "latency_ms": res.latency_ms,
+                                            "timestamp": time.time()
+                                        }
+                                        if self.telemetry:
+                                            self.telemetry.log_event("SHADOW_COMPARISON", shadow_data)
+                                        if self.on_shadow_evidence:
+                                            try:
+                                                self.on_shadow_evidence(shadow_data)
+                                            except Exception:
+                                                pass
+                                        inst.on_action_dispatched()
+                                        inst.advance_step()
+                                        if self.on_state_change:
+                                            self.on_state_change(owner_region, inst.state.value, inst.current_step_index)
+                                    elif not self.is_dry_run:
+                                        # Strict Invariant: Check deadline immediately before dispatch
+                                        if inst.is_deadline_expired():
+                                            logger.warning(f"Region {owner_region}: Step deadline expired before action dispatch")
+                                            inst.transition_to(RegionState.TIMEOUT, reason="Step deadline expired before action dispatch")
+                                            continue
+
+                                        # Invariant Check: Verify generation & state immediately before dispatch
+                                        if inst.generation != snapshot_gen or inst.current_step_index != snapshot_step or inst.state != RegionState.VERIFIED:
+                                            logger.warning(f"Region {owner_region}: Generation, step or state mismatch before dispatch.")
+                                            continue
+
+                                        if not inst.can_attempt_dispatch():
+                                            logger.warning(f"Region {owner_region} exhausted dispatch attempt budget")
+                                            inst.transition_to(RegionState.REJECTED, reason="Dispatch retry budget exhausted")
+                                            continue
+
+                                        # Telemetry critical reservation
+                                        token = None
+                                        if self.telemetry:
+                                            token = self.telemetry.reserve_critical_slots(count=2)
+                                            if token is None:
+                                                logger.error(f"Telemetry buffer full. SAFE_PAUSE triggered for Region {owner_region}")
+                                                inst.transition_to(RegionState.SAFE_PAUSE, reason="Telemetry buffer full, cannot guarantee audit evidence")
+                                                continue
+
+                                            intent_data = {
+                                                "region_id": owner_region,
+                                                "step_index": inst.current_step_index,
+                                                "generation": inst.generation,
+                                                "target_id": expected_target_id,
+                                                "screen_pos": (screen_x, screen_y),
+                                                "context": action_context
+                                            }
+                                            intent_ok = False
+                                            if hasattr(self.telemetry, "consume"):
+                                                intent_ok = bool(self.telemetry.consume(token, "ACTION_INTENT", intent_data))
+                                            elif hasattr(token, "consume"):
+                                                intent_ok = bool(token.consume("ACTION_INTENT", intent_data))
                                             else:
-                                                # Dry-Run mode: Advance without dispatching
-                                                logger.info(f"[DRY-RUN] WOULD_CLICK at ({cand_cx}, {cand_cy}) for Region {owner_region}")
-                                                inst.advance_step()
+                                                self.telemetry.log_event("ACTION_INTENT", intent_data)
+                                                intent_ok = True
+
+                                            if not intent_ok:
+                                                logger.error(f"Critical ACTION_INTENT rejected for Region {owner_region}. Halting dispatch with SAFE_PAUSE.")
+                                                if hasattr(self.telemetry, "release"):
+                                                    self.telemetry.release(token)
+                                                elif hasattr(token, "release"):
+                                                    token.release()
+                                                inst.transition_to(RegionState.SAFE_PAUSE, reason="Critical ACTION_INTENT audit recording rejected")
                                                 if self.on_state_change:
                                                     self.on_state_change(owner_region, inst.state.value, inst.current_step_index)
+                                                continue
+
+                                        # Record attempt counter before dispatch
+                                        inst.on_action_attempt()
+
+                                        dispatched = self.action_manager.dispatch_action(screen_x, screen_y, action_context)
+
+                                        outcome_ok = True
+                                        if token and self.telemetry:
+                                            outcome_data = {
+                                                "region_id": owner_region,
+                                                "step_index": inst.current_step_index,
+                                                "generation": inst.generation,
+                                                "dispatched": bool(dispatched),
+                                                "timestamp": time.time()
+                                            }
+                                            if hasattr(self.telemetry, "consume"):
+                                                outcome_ok = bool(self.telemetry.consume(token, "ACTION_OUTCOME", outcome_data))
+                                            elif hasattr(token, "consume"):
+                                                outcome_ok = bool(token.consume("ACTION_OUTCOME", outcome_data))
+                                            else:
+                                                self.telemetry.log_event("ACTION_OUTCOME", outcome_data)
+                                                outcome_ok = True
+
+                                            if not outcome_ok:
+                                                logger.error(f"Critical ACTION_OUTCOME rejected for Region {owner_region}. Marking evidence incomplete and pausing execution.")
+                                                if hasattr(self.telemetry, "release"):
+                                                    self.telemetry.release(token)
+                                                elif hasattr(token, "release"):
+                                                    token.release()
+
+                                        # Handle Action Outcome with explicit ActionDispatchResult handling
+                                        if isinstance(dispatched, ActionDispatchResult) or hasattr(dispatched, "status"):
+                                            status = getattr(dispatched, "status", None)
+                                            reason = getattr(dispatched, "reason", "")
+                                            if status == ActionDispatchStatus.UNCERTAIN:
+                                                logger.warning(f"Uncertain action dispatch for Region {owner_region}: {reason}")
+                                                inst.transition_to(RegionState.UNCERTAIN_HOLD, reason=reason or "Action uncertain")
+                                                if not outcome_ok:
+                                                    inst.transition_to(RegionState.SAFE_PAUSE, reason="Critical ACTION_OUTCOME evidence recording failed")
+                                                if self.on_state_change:
+                                                    self.on_state_change(owner_region, inst.state.value, inst.current_step_index)
+                                                continue
+                                            elif status == ActionDispatchStatus.FAIL_CLOSED:
+                                                logger.error(f"Fail-closed action dispatch for Region {owner_region}: {reason}")
+                                                inst.transition_to(RegionState.REJECTED, reason=reason or "Action fail-closed")
+                                                if not outcome_ok:
+                                                    inst.transition_to(RegionState.SAFE_PAUSE, reason="Critical ACTION_OUTCOME evidence recording failed")
+                                                if self.on_state_change:
+                                                    self.on_state_change(owner_region, inst.state.value, inst.current_step_index)
+                                                continue
+                                            elif status == ActionDispatchStatus.NOT_SENT:
+                                                logger.warning(f"Action not sent for Region {owner_region}: {reason}")
+                                                if inst.can_attempt_dispatch() and outcome_ok:
+                                                    inst.transition_to(RegionState.WAIT_STEP, reason="Action not sent; retry available within deadline")
+                                                else:
+                                                    inst.transition_to(RegionState.REJECTED, reason=f"Action not sent: {reason}" if reason else "Action not sent and retry budget exhausted")
+                                                if not outcome_ok:
+                                                    inst.transition_to(RegionState.SAFE_PAUSE, reason="Critical ACTION_OUTCOME evidence recording failed")
+                                                if self.on_state_change:
+                                                    self.on_state_change(owner_region, inst.state.value, inst.current_step_index)
+                                                continue
+                                            elif status == ActionDispatchStatus.DISPATCHED:
+                                                inst.on_action_dispatched()
+                                                if outcome_ok:
+                                                    inst.advance_step()
+                                                else:
+                                                    inst.transition_to(RegionState.SAFE_PAUSE, reason="Critical ACTION_OUTCOME evidence recording failed")
+                                                if self.on_state_change:
+                                                    self.on_state_change(owner_region, inst.state.value, inst.current_step_index)
+                                                continue
+
+                                        # Generic boolean handling (legacy / mocks)
+                                        if bool(dispatched):
+                                            inst.on_action_dispatched()
+                                            if outcome_ok:
+                                                inst.advance_step()
+                                            else:
+                                                inst.transition_to(RegionState.SAFE_PAUSE, reason="Critical ACTION_OUTCOME evidence recording failed")
+                                            if self.on_state_change:
+                                                self.on_state_change(owner_region, inst.state.value, inst.current_step_index)
+                                            continue
+                                        else:
+                                            logger.warning(f"Failed to dispatch action for Region {owner_region}")
+                                            if inst.can_attempt_dispatch() and outcome_ok:
+                                                inst.transition_to(RegionState.WAIT_STEP, reason="Dispatch failed; retry available within deadline")
+                                            else:
+                                                inst.transition_to(RegionState.REJECTED, reason="Dispatch failed and retry limit reached")
+                                            if not outcome_ok:
+                                                inst.transition_to(RegionState.SAFE_PAUSE, reason="Critical ACTION_OUTCOME evidence recording failed")
+                                            if self.on_state_change:
+                                                self.on_state_change(owner_region, inst.state.value, inst.current_step_index)
+                                            continue
+                                    else:
+                                        # Dry-Run mode: Advance without dispatching
+                                        logger.info(f"[DRY-RUN] WOULD_CLICK at ({screen_x}, {screen_y}) for Region {owner_region}")
+                                        inst.advance_step()
+                                        if self.on_state_change:
+                                            self.on_state_change(owner_region, inst.state.value, inst.current_step_index)
 
             # Precise pacing
             t_elapsed = time.perf_counter() - t_cycle_start

@@ -21,7 +21,6 @@ class ActionType(str, Enum):
     CLICK = "CLICK"
     DOUBLE_CLICK = "DOUBLE_CLICK"
     DETECT_ONLY = "DETECT_ONLY"
-    CUSTOM = "CUSTOM"
 
 
 class CalibrationProfile(BaseModel):
@@ -42,6 +41,7 @@ class CalibrationProfile(BaseModel):
     separation_gap: float = 0.0
     sample_count_pos: int = 0
     sample_count_neg: int = 0
+    target_content_hash: Optional[str] = None
     calibrated_at: float = Field(default_factory=time.time)
 
     def is_valid_for(
@@ -49,14 +49,22 @@ class CalibrationProfile(BaseModel):
         model_sha256: str,
         precision: str,
         canonical_size: Tuple[int, int],
-        preprocessing_version: str = "v2.3_canonical_letterbox"
+        preprocessing_version: str = "v2.3_canonical_letterbox",
+        target_content_hash: Optional[str] = None
     ) -> bool:
-        return (
+        base_valid = (
             self.model_sha256 == model_sha256
             and self.precision == precision
             and self.canonical_size == canonical_size
             and self.preprocessing_version == preprocessing_version
         )
+        if not base_valid:
+            return False
+        if target_content_hash is not None:
+            if not self.target_content_hash:
+                return False
+            return self.target_content_hash == target_content_hash
+        return True
 
 
 class Target(BaseModel):
@@ -72,6 +80,36 @@ class Target(BaseModel):
     calibration: Optional[CalibrationProfile] = None
     created_at: float = Field(default_factory=time.time)
 
+    def compute_content_hash(self) -> str:
+        """Computes deterministic, path-independent SHA-256 hash across target reference and confuser image contents (W05)."""
+        import hashlib
+        import os
+        h = hashlib.sha256()
+
+        ref_hashes = []
+        for p in self.reference_image_paths:
+            if os.path.exists(p):
+                try:
+                    with open(p, "rb") as f:
+                        ref_hashes.append(hashlib.sha256(f.read()).hexdigest())
+                except Exception:
+                    pass
+        for r_hash in sorted(ref_hashes):
+            h.update(f"ref:{r_hash}".encode("utf-8"))
+
+        conf_hashes = []
+        for p in self.confuser_image_paths:
+            if os.path.exists(p):
+                try:
+                    with open(p, "rb") as f:
+                        conf_hashes.append(hashlib.sha256(f.read()).hexdigest())
+                except Exception:
+                    pass
+        for c_hash in sorted(conf_hashes):
+            h.update(f"conf:{c_hash}".encode("utf-8"))
+
+        return h.hexdigest()
+
 
 class RegionModel(BaseModel):
     """
@@ -85,6 +123,22 @@ class RegionModel(BaseModel):
     w: int
     h: int
     enabled: bool = True
+    workflow_id: Optional[str] = None
+
+
+SCHEMA_VERSION: int = 2
+
+
+class SafetyConfig(BaseModel):
+    """
+    Canonical anti-runaway and quota safety bounds.
+    """
+    max_clicks_per_second: float = 10.0
+    circuit_breaker_threshold: int = 30
+    circuit_breaker_window_sec: float = 5.0
+    max_clicks_per_region: int = 100
+    max_total_clicks: int = 1000
+    auto_stop_minutes: float = 0.0
 
 
 class WorkflowStep(BaseModel):
@@ -114,11 +168,14 @@ class Profile(BaseModel):
     """
     profile_id: str
     name: str
+    schema_version: int = SCHEMA_VERSION
+    emergency_hotkey: str = "F12"
     monitor_index: int = 0
     roi: Optional[Tuple[int, int, int, int]] = None # (x, y, w, h)
     regions: Dict[str, RegionModel] = Field(default_factory=dict)
     targets: Dict[str, Target] = Field(default_factory=dict)
     workflows: Dict[str, Workflow] = Field(default_factory=dict)
+    safety_config: SafetyConfig = Field(default_factory=SafetyConfig)
     scan_interval_ms: int = 16 # ~60 FPS
     created_at: float = Field(default_factory=time.time)
 
@@ -130,6 +187,8 @@ class DecisionResult(BaseModel):
     """
     target_id: Optional[str] = None
     region_id: Optional[str] = None
+    workflow_id: Optional[str] = None
+    generation: int = 0
     candidate_rect: Tuple[int, int, int, int] # (x, y, w, h)
     geometry_score: float
     geometry_pass: bool
@@ -139,4 +198,7 @@ class DecisionResult(BaseModel):
     margin_pass: bool
     decision: DecisionClass
     reason: str
+    capture_timestamp: float = 0.0
+    dispatch_timestamp: float = 0.0
+    latency_ms: float = 0.0
     timestamp: float = Field(default_factory=time.time)
