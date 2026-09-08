@@ -535,6 +535,7 @@ class TargetCalibrationDialog(QDialog):
             all_neg = list(dict.fromkeys(self.session_a_neg + self.session_b_neg))
             self.target.reference_image_paths = all_pos
             self.target.confuser_image_paths = all_neg
+            calib_result.target_content_hash = self.target.compute_content_hash()
             self.target.calibration = calib_result
 
             self.btn_save.setEnabled(True)

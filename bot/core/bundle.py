@@ -141,24 +141,56 @@ class ProfileBundleManager:
                     if new_conf_paths:
                         target.confuser_image_paths = new_conf_paths
 
-                # 3. Geometry Revalidation (FC-12)
+                # 3. Geometry Revalidation & Safe Re-resolution (FC-12, U08)
+                geometry_rebound = False
                 try:
                     import mss
                     mss_cls = getattr(mss, "MSS", mss.mss)
                     with mss_cls() as sct:
-                        v_mon = sct.monitors[0]
-                        v_w, v_h = v_mon["width"], v_mon["height"]
+                        num_mons = len(sct.monitors) - 1
+                        # Rebind monitor_index if it doesn't exist on this hardware
+                        if profile.monitor_index < 0 or profile.monitor_index > num_mons:
+                            logger.warning(
+                                f"Imported monitor index {profile.monitor_index} does not exist on this machine "
+                                f"(available: 0..{num_mons}). Rebinding to primary monitor 1."
+                            )
+                            profile.monitor_index = 1
+                            geometry_rebound = True
+
+                        target_mon = sct.monitors[profile.monitor_index]
+                        m_w, m_h = target_mon["width"], target_mon["height"]
+
+                        # Revalidate and clamp/reset ROI
                         if profile.roi:
                             rx, ry, rw, rh = profile.roi
-                            if rw > v_w or rh > v_h:
-                                logger.warning(f"Imported ROI {profile.roi} exceeds current screen bounds ({v_w}x{v_h}).")
+                            if rx < 0 or ry < 0 or rw <= 0 or rh <= 0 or rx + rw > m_w or ry + rh > m_h:
+                                logger.warning(
+                                    f"Imported ROI {profile.roi} exceeds Monitor {profile.monitor_index} bounds ({m_w}x{m_h}). "
+                                    f"Resetting ROI to full-screen capture."
+                                )
+                                profile.roi = None
+                                geometry_rebound = True
+
+                        # Revalidate and clamp all region coordinates
                         for r_id, reg in profile.regions.items():
-                            if reg.w > v_w or reg.h > v_h:
-                                logger.warning(f"Imported region '{r_id}' dimensions ({reg.w}x{reg.h}) exceed display bounds ({v_w}x{v_h}).")
+                            orig_box = (reg.x, reg.y, reg.w, reg.h)
+                            if reg.x < 0 or reg.y < 0 or reg.w <= 0 or reg.h <= 0 or reg.x + reg.w > m_w or reg.y + reg.h > m_h:
+                                reg.x = max(0, min(reg.x, m_w - 32))
+                                reg.y = max(0, min(reg.y, m_h - 32))
+                                reg.w = max(16, min(reg.w, m_w - reg.x))
+                                reg.h = max(16, min(reg.h, m_h - reg.y))
+                                logger.warning(
+                                    f"Imported region '{r_id}' coordinates {orig_box} were out of bounds for "
+                                    f"Monitor {profile.monitor_index} ({m_w}x{m_h}). Clamped to ({reg.x}, {reg.y}, {reg.w}, {reg.h})."
+                                )
+                                geometry_rebound = True
+
                 except Exception as geo_err:
                     logger.warning(f"Geometry revalidation check encountered warning: {geo_err}")
 
                 logger.info(f"Profile '{profile.name}' safely imported from {zip_path}")
+                if geometry_rebound:
+                    return profile, "IMPORT_SUCCESS_GEOMETRY_REBOUND"
                 return profile, "IMPORT_SUCCESS"
 
         except Exception as exc:

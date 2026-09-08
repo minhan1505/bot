@@ -184,8 +184,11 @@ class ActionManager:
         # Dispatch through verified non-physical backend
         if action_type == "DOUBLE_CLICK" and hasattr(self.backend, "dispatch_double_click"):
             raw_result = self.backend.dispatch_double_click(screen_x, screen_y, context)
-        else:
+        elif action_type == "CLICK":
             raw_result = self.backend.dispatch_click(screen_x, screen_y, context)
+        else:
+            logger.error(f"UNSUPPORTED_ACTION_TYPE: Action type '{action_type}' is not supported. Failing closed.")
+            return ActionDispatchResult(ActionDispatchStatus.FAIL_CLOSED, f"Unsupported action type: {action_type}", target_screen_pt=(screen_x, screen_y))
 
         if isinstance(raw_result, ActionDispatchResult):
             result = raw_result
@@ -201,6 +204,15 @@ class ActionManager:
             self._total_clicks += clicks_count
             if region_id:
                 self._region_clicks[region_id] = self._region_clicks.get(region_id, 0) + clicks_count
+            if len(self._recent_click_timestamps) >= self.circuit_breaker_threshold:
+                self._circuit_breaker_tripped = True
+                logger.critical(f"ANTI-RUNAWAY CIRCUIT BREAKER TRIPPED! ({len(self._recent_click_timestamps)} actions in {cb_window} sec). Bot halted.")
+        elif result.status == ActionDispatchStatus.UNCERTAIN and "click 1 sent" in result.reason:
+            # U01 / T01 Outcome Truth: Partial double-click dispatch. Record the 1 transmitted click.
+            self._recent_click_timestamps.append(now)
+            self._total_clicks += 1
+            if region_id:
+                self._region_clicks[region_id] = self._region_clicks.get(region_id, 0) + 1
             if len(self._recent_click_timestamps) >= self.circuit_breaker_threshold:
                 self._circuit_breaker_tripped = True
                 logger.critical(f"ANTI-RUNAWAY CIRCUIT BREAKER TRIPPED! ({len(self._recent_click_timestamps)} actions in {cb_window} sec). Bot halted.")

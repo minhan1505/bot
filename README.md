@@ -1,4 +1,4 @@
-# BotAutoClick V2.4 — Generic Vision & Background Automation Engine
+# BotAutoClick V2.3 — Generic Vision & Background Automation Engine
 
 A clean-room, generic, multi-table desktop automation bot engineered in accordance with the **Universal Senior Developer Protocol** (`quytatchuan.txt`) and **Functional Completion Specification (FC-01 → FC-15)**.
 
@@ -67,8 +67,8 @@ A clean-room, generic, multi-table desktop automation bot engineered in accordan
 | **FC-10** | **Safety Controls UI & Persistence** (Max actions/min rate limiting, runtime auto-stop duration, debounce window) | ✅ Complete | `tests/test_functional_completion.py::test_fc10_*` |
 | **FC-11** | **Live Metrics & Evidence Logging** (MATCH/UNKNOWN/NON-MATCH/REJECT/TOTAL badges, P50/P95/P99 latency, async crop logging) | ✅ Complete | `tests/test_functional_completion.py::test_fc11_*` |
 | **FC-12** | **Bundle Completeness** (Export/import targets + confusers, Zip Slip defense, screen geometry revalidation) | ✅ Complete | `tests/test_functional_completion.py::test_fc12_*` |
-| **FC-13** | **Schema Versioning & Migration** (V2.4 / Schema v2 with transparent backward compatibility for legacy V2.3 profiles) | ✅ Complete | `tests/test_functional_completion.py::test_fc13_*` |
-| **FC-14** | **Comprehensive Test Wiring** (110 automated tests covering all features, edge cases, and safety guards) | ✅ Complete | `tests/` and `qa/` (110 passed) |
+| **FC-13** | **Schema Versioning & Migration** (Schema v2 with transparent backward compatibility for legacy profiles) | ✅ Complete | `tests/test_functional_completion.py::test_fc13_*` |
+| **FC-14** | **Comprehensive Test Wiring** (Automated tests covering all features, edge cases, and safety guards) | ✅ Complete | `tests/` and `qa/` |
 | **FC-15** | **Documentation Integrity & Honest Status** (Purged legacy licensing claims, explicit PARTIAL tracking for F07/F08) | ✅ Complete | `README.md`, `AUDIT_CHECKLIST.md` |
 
 ---
@@ -91,7 +91,7 @@ D:\xampp\bot\
 │   │   ├── dpi.py                           # Windows Per-Monitor DPI Awareness V2
 │   │   ├── coordinates.py                   # Canonical CoordinateMapper (Screen ↔ Client ↔ Viewport ↔ CSS ↔ Region)
 │   │   ├── models.py                        # Pydantic V2 Schemas: Target, Region, Workflow, CalibrationProfile, Decision
-│   │   ├── database.py                      # SQLite persistence (Profiles, Snapshots, Audit Logs) & V2.3->V2.4 Migration
+│   │   ├── database.py                      # SQLite persistence (Profiles, Snapshots, Audit Logs) & Schema Migration
 │   │   ├── bundle.py                        # ZIP Profile Export/Import with Confusers & Zip Slip defense
 │   │   └── hotkey.py                        # Configurable Global Emergency Hotkey (F8-F12, modifiers)
 │   ├── capture/

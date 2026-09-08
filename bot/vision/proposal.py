@@ -81,7 +81,7 @@ class CandidateProposalEngine:
     def __init__(
         self,
         k_base_per_region: int = 4,
-        max_batch_limit: int = 32,
+        max_batch_limit: int = 128,
         scales: Tuple[float, ...] = (0.85, 1.0, 1.15)
     ):
         self.k_base = k_base_per_region
@@ -235,8 +235,9 @@ class CandidateProposalEngine:
 
         for r_id, props in proposals_by_region.items():
             if len(props) > self.k_base:
-                # Region has overflow
-                diagnostics[r_id] = f"PROPOSAL_OVERFLOW(count={len(props)}, capped_to={self.k_base})"
+                # Region has overflow where candidates had to be truncated.
+                # U07 Invariant: Recall cannot be guaranteed for truncated region!
+                diagnostics[r_id] = f"PROPOSAL_OVERFLOW_UNGUARANTEED_RECALL(count={len(props)}, capped_to={self.k_base})"
                 # Sort by proposal score and take top K_base
                 sorted_props = sorted(props, key=lambda p: p.score, reverse=True)
                 final_list.extend(sorted_props[:self.k_base])

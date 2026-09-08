@@ -125,11 +125,18 @@ class ONNXVerifier:
 
     def compute_embeddings(self, images: List[np.ndarray]) -> np.ndarray:
         """
-        Computes L2-normalized feature embeddings for a batch of images.
+        Computes L2-normalized feature embeddings for a batch of images (U07).
+        Safely chunks batches larger than 64 to prevent memory spikes.
         Returns np.ndarray of shape [B, D].
         """
         if not images:
             return np.empty((0, self.native_embedding_dim), dtype=np.float32)
+
+        if len(images) > 64:
+            chunk_embs = []
+            for i in range(0, len(images), 64):
+                chunk_embs.append(self.compute_embeddings(images[i:i + 64]))
+            return np.vstack(chunk_embs)
 
         batch_tensors = [self.letterbox_preprocess(img, self.canonical_size) for img in images]
         batch_input = np.stack(batch_tensors, axis=0).astype(np.float32)

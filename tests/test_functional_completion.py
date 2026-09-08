@@ -16,7 +16,7 @@ Covers:
   - FC-10: SafetyConfig Persistence, Auto-Stop Timer & Rate Limiting
   - FC-11: Telemetry Counters, P50/P95/P99 Percentiles & Asynchronous Evidence Logging
   - FC-12: Bundle Completeness (Confusers & Display Geometry Revalidation)
-  - FC-13: Configuration Schema Versioning & V2.3 -> V2.4 Migration
+  - FC-13: Configuration Schema Versioning & Migration
 """
 
 import os
@@ -49,7 +49,7 @@ from bot.vision.engine import VisionEngine
 from bot.workflow.ledger import SessionLedger
 from bot.workflow.runner import BotRuntimeRunner
 from bot.workflow.state_machine import RegionState
-from bot.action.base import ActionDispatchResult, ActionDispatchStatus
+from bot.action.base import ActionDispatchResult, ActionDispatchStatus, BaseActionBackend
 from bot.action.manager import ActionManager
 from bot.core.bundle import ProfileBundleManager
 from tests.test_action_and_safety import MockWorkingBackend
@@ -616,3 +616,328 @@ def test_fc13_schema_version_and_migration():
     assert prof.name == "Legacy V2.3 Profile"
     assert "r1" in prof.regions
     assert "t1" in prof.targets
+
+
+# ==============================================================================
+# AUDIT ITEMS U01 -> U08 REGRESSION SUITE
+# ==============================================================================
+
+class MockPartialFailingBackend(BaseActionBackend):
+    """Simulates a backend where click 1 succeeds, but click 2 fails (U01)."""
+    def __init__(self):
+        super().__init__()
+        self.click_call_count = 0
+
+    def probe_capability(self, window_handle: int = 0) -> tuple:
+        return True, "CAPABILITY_OK"
+
+    def dispatch_click(self, screen_x: int, screen_y: int, context: dict) -> ActionDispatchResult:
+        self.click_call_count += 1
+        if self.click_call_count == 1:
+            return ActionDispatchResult(ActionDispatchStatus.DISPATCHED, "Click 1 ok", target_screen_pt=(screen_x, screen_y))
+        else:
+            return ActionDispatchResult(ActionDispatchStatus.NOT_SENT, "Click 2 connection lost", target_screen_pt=(screen_x, screen_y))
+
+    def close(self):
+        pass
+
+
+def test_u01_double_click_partial_dispatch_is_uncertain_and_counts_click():
+    backend = MockPartialFailingBackend()
+    manager = ActionManager()
+    manager.probe_and_bind(backend, {})
+
+    context = {"action_type": ActionType.DOUBLE_CLICK.value, "region_id": "reg_1"}
+    res = manager.dispatch_action(100, 200, context)
+
+    # U01 / T01 Invariant: Under partial dispatch, status MUST be UNCERTAIN, never NOT_SENT!
+    assert res.status == ActionDispatchStatus.UNCERTAIN
+    assert "click 1 sent, click 2 failed" in res.reason
+
+    # Outcome Truth: The 1 physically transmitted click MUST be recorded against history & quotas
+    assert manager._total_clicks == 1
+    assert manager._region_clicks.get("reg_1") == 1
+    assert len(manager._recent_click_timestamps) == 1
+
+
+def test_u02_hotkey_conflict_rolls_back_to_previous_binding():
+    manager = GlobalHotkeyManager(hotkey_str="F12")
+
+    # Mock manager.start() to fail on 'F8' (HOTKEY_CONFLICT) but succeed on 'F12'
+    def fake_start():
+        if manager.hotkey_str == "F8":
+            return False, "HOTKEY_CONFLICT: Key already claimed by another application"
+        return True, "HOTKEY_REGISTERED"
+
+    with patch.object(manager, "is_alive", return_value=True):
+        with patch.object(manager, "start", side_effect=fake_start):
+            assert manager.hotkey_str == "F12"
+
+            # Attempt to change to F8 which conflicts
+            ok, msg = manager.update_hotkey("F8")
+
+            assert ok is False
+            assert "HOTKEY_CONFLICT" in msg
+            # U02 Safety Invariant: Manager MUST safely revert to previous working hotkey
+            assert manager.hotkey_str == "F12"
+            assert manager.vk_code == 0x7B  # VK_F12
+
+
+def test_u03_atomic_profile_activation_updates_runtime_managers(tmp_path):
+    from bot.ui.main_window import MainWindow
+    from PySide6.QtWidgets import QApplication
+
+    app = QApplication.instance() or QApplication([])
+
+    db_file = str(tmp_path / "test_u03.db")
+    win = MainWindow(db_path=db_file)
+
+    prof_a = Profile(
+        profile_id="prof_a",
+        name="Profile A",
+        monitor_index=1,
+        emergency_hotkey="F12",
+        roi=None
+    )
+    prof_b = Profile(
+        profile_id="prof_b",
+        name="Profile B",
+        monitor_index=2,
+        emergency_hotkey="F9",
+        roi=(10, 20, 300, 400)
+    )
+
+    win.db.save_profile(prof_a)
+    win.db.save_profile(prof_b)
+
+    # Activate Profile A
+    ok, _ = win.activate_profile(prof_a)
+    assert ok is True
+    assert win.active_profile.profile_id == "prof_a"
+    assert win.capture_manager.monitor_index == 1
+    assert win.hotkey_manager.hotkey_str == "F12"
+    assert win.capture_manager.roi is None
+
+    # Switch to Profile B
+    with patch.object(win.capture_manager, "validate_roi", return_value=(True, "")):
+        with patch.object(win.hotkey_manager, "update_hotkey", return_value=(True, "HOTKEY_REGISTERED")):
+            win.activate_profile(prof_b)
+
+            # U03 Invariant: Runtime objects MUST point to Profile B values
+            assert win.active_profile.profile_id == "prof_b"
+            assert win.capture_manager.monitor_index == 2
+            assert win.capture_manager.roi == (10, 20, 300, 400)
+
+    win.close()
+
+
+def test_u04_custom_action_type_not_present_and_unsupported_fails_closed():
+    # Verify CUSTOM is not an ActionType
+    action_types = [a.value for a in ActionType]
+    assert "CUSTOM" not in action_types
+    assert set(action_types) == {"CLICK", "DOUBLE_CLICK", "DETECT_ONLY"}
+
+    # Verify ActionManager fails closed on unknown/unsupported action type
+    manager = ActionManager()
+    manager.probe_and_bind(MockWorkingBackend(), {})
+    bad_context = {"action_type": "UNSUPPORTED_TYPE"}
+    res = manager.dispatch_action(50, 50, bad_context)
+
+    # U04 Invariant: Unsupported action types MUST fail closed, never silently click!
+    assert res.status == ActionDispatchStatus.FAIL_CLOSED
+    assert "Unsupported action type" in res.reason
+    assert manager._total_clicks == 0
+
+
+def test_u05_multi_reference_target_recognition_runtime():
+    from bot.core.coordinates import Rect
+    from bot.vision.proposal import CandidateProposal
+
+    onnx_v = ONNXVerifier(model_path=MODEL_PATH)
+    geo_v = GeometryVerifier(canonical_size=(64, 64))
+    engine = VisionEngine(onnx_verifier=onnx_v, geometry_verifier=geo_v)
+
+    # Ref 1: circle glyph
+    ref1 = make_glyph_image("CIRCLE")
+    # Ref 2: cross glyph
+    ref2 = make_glyph_image("CROSS")
+
+    calib = CalibrationProfile(
+        model_sha256=onnx_v.model_sha256,
+        precision=onnx_v.precision,
+        canonical_size=(64, 64),
+        t_g=0.5,
+        t_e=0.6,
+        m_safe=0.05
+    )
+    target = Target(
+        target_id="target_multiref",
+        name="Multi-Ref Target",
+        reference_image_paths=[],
+        calibration=calib
+    )
+
+    # Candidate frame containing CROSS (matches Ref 2, but not Ref 1)
+    frame = np.zeros((128, 128, 3), dtype=np.uint8)
+    frame[32:80, 32:80] = ref2
+
+    candidate = CandidateProposal(
+        rect=Rect(32, 32, 48, 48),
+        region_id="reg_1",
+        score=0.9
+    )
+
+    # Evaluate with both references passed
+    decisions = engine.evaluate_candidates(
+        frame=frame,
+        candidates=[candidate],
+        target=target,
+        target_reference_img=[ref1, ref2]
+    )
+
+    assert len(decisions) == 1
+    # U05 Invariant: Candidate matching ANY of the reference images must pass Gate 1 Geometry
+    assert decisions[0].geometry_pass is True
+    assert decisions[0].geometry_score >= 0.5
+
+
+def test_u06_target_dialog_deep_copy_cancel_and_calibration_invalidation(tmp_path):
+    from bot.ui.target_dialog import TargetDetailsDialog
+    from PySide6.QtWidgets import QApplication
+
+    app = QApplication.instance() or QApplication([])
+
+    img_a = str(tmp_path / "ref_a.png")
+    img_b = str(tmp_path / "ref_b.png")
+    cv2.imwrite(img_a, np.zeros((32, 32, 3), dtype=np.uint8))
+    cv2.imwrite(img_b, np.ones((32, 32, 3), dtype=np.uint8) * 255)
+
+    original_target = Target(
+        target_id="t_u06",
+        name="Original Name",
+        reference_image_paths=[img_a],
+        confuser_image_paths=[],
+        calibration=CalibrationProfile(
+            model_sha256="abc",
+            t_g=0.5,
+            t_e=0.65,
+            m_safe=0.05
+        )
+    )
+
+    # 1. Test Cancel is strict NO-OP
+    dlg_cancel = TargetDetailsDialog(original_target)
+    dlg_cancel.target.reference_image_paths.append(img_b)
+    dlg_cancel.target.name = "Mutated Name"
+    dlg_cancel.reject()  # User clicks Cancel
+
+    assert original_target.name == "Original Name"
+    assert len(original_target.reference_image_paths) == 1
+    assert original_target.calibration is not None
+
+    # 2. Test Save with reference changes forces calibration invalidation
+    dlg_save = TargetDetailsDialog(original_target)
+    dlg_save.target.reference_image_paths.append(img_b)
+    with patch("PySide6.QtWidgets.QMessageBox.information"):
+        dlg_save._save_and_close()
+
+    # U06 Invariant: Identity-defining reference change MUST invalidate calibration (calibration = None)
+    assert len(original_target.reference_image_paths) == 2
+    assert original_target.calibration is None
+
+    # 3. Test stale target_content_hash rejection in is_valid_for
+    calib = CalibrationProfile(
+        model_sha256="abc",
+        t_g=0.5,
+        t_e=0.65,
+        m_safe=0.05,
+        target_content_hash="old_content_hash_123"
+    )
+    assert calib.is_valid_for("abc", "FP32", (64, 64), target_content_hash="new_content_hash_456") is False
+    assert calib.is_valid_for("abc", "FP32", (64, 64), target_content_hash="old_content_hash_123") is True
+
+
+def test_u07_proposal_escalation_no_silent_drop_and_overflow_fault():
+    from bot.core.coordinates import Rect
+    from bot.vision.proposal import CandidateProposal
+
+    # 1. Counterexample where true target ranks #5 on coarse score (below K_base=4):
+    engine = CandidateProposalEngine(k_base_per_region=4, max_batch_limit=128)
+    props = [CandidateProposal(rect=Rect(i * 10, i * 10, 20, 20), region_id="r1", score=1.0 - (i * 0.05)) for i in range(8)]
+    true_target_proposal = props[5]
+
+    final_props, diags = engine.apply_same_frame_escalation({"r1": props})
+
+    # Under exhaustive escalation, ALL 8 proposals are kept!
+    assert len(final_props) == 8
+    assert true_target_proposal in final_props
+    assert diags["r1"] == "EXHAUSTIVE_ESCALATION_KEPT"
+
+    # 2. Test proposal overflow (> max_batch_limit):
+    small_batch_engine = CandidateProposalEngine(k_base_per_region=4, max_batch_limit=10)
+    overflow_props = [CandidateProposal(rect=Rect(i, i, 10, 10), region_id="r1", score=float(i)) for i in range(15)]
+    kept_props, over_diags = small_batch_engine.apply_same_frame_escalation({"r1": overflow_props})
+
+    assert len(kept_props) == 4
+    assert "PROPOSAL_OVERFLOW_UNGUARANTEED_RECALL" in over_diags["r1"]
+
+
+def test_u08_bundle_import_safe_geometry_re_resolution(tmp_path):
+    import zipfile
+
+    dest_dir = str(tmp_path / "targets")
+    zip_file = str(tmp_path / "test_u08_bundle.zip")
+
+    profile_data = {
+        "schema_version": 2,
+        "profile_id": "p_u08",
+        "name": "Out of Bounds Profile",
+        "monitor_index": 99,  # Non-existent monitor
+        "roi": [5000, 5000, 1000, 1000],  # Out of bounds ROI
+        "regions": {
+            "r_overflow": {
+                "region_id": "r_overflow",
+                "name": "Overflow Region",
+                "x": 4000,
+                "y": 3000,
+                "w": 500,
+                "h": 500,
+                "workflow_id": "wf_1"
+            }
+        },
+        "targets": {},
+        "workflows": {},
+        "safety_config": {"max_actions_per_minute": 60}
+    }
+
+    with zipfile.ZipFile(zip_file, "w") as zf:
+        zf.writestr("profile.json", json.dumps(profile_data))
+
+    mock_monitors = [
+        {"left": 0, "top": 0, "width": 1920, "height": 1080},  # Virtual monitor [0]
+        {"left": 0, "top": 0, "width": 1920, "height": 1080},  # Primary monitor [1]
+    ]
+
+    with patch("mss.mss") as mock_mss:
+        mock_instance = MagicMock()
+        mock_instance.monitors = mock_monitors
+        mock_instance.__enter__.return_value = mock_instance
+        mock_mss.return_value = mock_instance
+
+        prof, status = ProfileBundleManager.safe_import_profile_from_zip(zip_file, dest_targets_dir=dest_dir)
+
+        # U08 Invariant: Profile must be rebound safely
+        assert prof is not None
+        assert status == "IMPORT_SUCCESS_GEOMETRY_REBOUND"
+
+        # Monitor 99 rebound to primary monitor 1
+        assert prof.monitor_index == 1
+
+        # Out-of-bounds ROI was reset to None (full screen fallback)
+        assert prof.roi is None
+
+        # Out-of-bounds Region was clamped inside (1920, 1080)
+        reg = prof.regions["r_overflow"]
+        assert reg.x + reg.w <= 1920
+        assert reg.y + reg.h <= 1080
+        assert reg.x >= 0 and reg.y >= 0

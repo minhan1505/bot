@@ -20,7 +20,7 @@ import time
 import cv2
 import numpy as np
 import logging
-from typing import Optional, Dict
+from typing import Optional, Dict, Tuple, List
 
 logger = logging.getLogger(__name__)
 
@@ -61,14 +61,14 @@ MODEL_PATH = os.path.abspath("models/ui_vision_encoder.onnx")
 
 
 class MainWindow(QMainWindow):
-    """PySide6 Desktop Application MainWindow with complete V2.4 functional pipeline."""
+    """PySide6 Desktop Application MainWindow with complete V2.3 functional pipeline."""
     decision_received_signal = Signal(object)
     region_state_signal = Signal(str, str, int)
     shadow_evidence_signal = Signal(dict)
 
     def __init__(self, db_path: str = "bot_data.db"):
         super().__init__()
-        self.setWindowTitle("BotAutoClick V2.4 — Vision Automation Suite")
+        self.setWindowTitle("BotAutoClick V2.3 — Vision Automation Suite")
         self.resize(1200, 850)
 
         self.db = Database(db_path)
@@ -561,12 +561,11 @@ class MainWindow(QMainWindow):
             name=f"Profile {prof_id[-4:]}"
         )
         self.db.save_profile(new_prof)
-        self.active_profile = new_prof
         self.combo_profiles.blockSignals(True)
         self.combo_profiles.addItem(new_prof.name, new_prof.profile_id)
         self.combo_profiles.setCurrentIndex(self.combo_profiles.count() - 1)
         self.combo_profiles.blockSignals(False)
-        self._refresh_profile_views()
+        self.activate_profile(new_prof)
 
     def _rename_active_profile(self):
         if not self.active_profile:
@@ -587,12 +586,11 @@ class MainWindow(QMainWindow):
             new_id = f"profile_{int(time.time())}"
             cloned = self.db.clone_profile(self.active_profile.profile_id, new_id, clone_name.strip())
             if cloned:
-                self.active_profile = cloned
                 self.combo_profiles.blockSignals(True)
                 self.combo_profiles.addItem(cloned.name, cloned.profile_id)
                 self.combo_profiles.setCurrentIndex(self.combo_profiles.count() - 1)
                 self.combo_profiles.blockSignals(False)
-                self._refresh_profile_views()
+                self.activate_profile(cloned)
                 QMessageBox.information(self, "Profile Cloned", f"Cloned into new profile '{cloned.name}'.")
 
     def _delete_active_profile(self):
@@ -744,19 +742,76 @@ class MainWindow(QMainWindow):
         self.db.save_profile(self.active_profile)
         QMessageBox.information(self, "Scan Scope Reset", "Scan scope reset to full screen capture.")
 
+    def activate_profile(self, profile: Profile) -> Tuple[bool, str]:
+        """
+        Atomic profile-activation path (U03).
+        Atomically applies:
+          1. Monitor binding to CaptureManager (with fallback/validation)
+          2. ROI scope to CaptureManager (validated against monitor bounds)
+          3. Emergency hotkey to GlobalHotkeyManager (with conflict rollback)
+          4. SafetyConfig parameters to ActionManager
+          5. Clears VisionEngine target cache
+          6. Refreshes UI controls and views
+        Enforces fail-closed error handling if critical components fail to bind.
+        """
+        if profile is None:
+            return False, "PROFILE_NONE"
+
+        self.active_profile = profile
+
+        # 1. Apply monitor to CaptureManager
+        target_mon = getattr(profile, "monitor_index", 1)
+        if hasattr(self, "capture_manager"):
+            try:
+                self.capture_manager.set_monitor(target_mon)
+            except Exception as exc:
+                logger.error(f"Failed to bind monitor {target_mon} on profile activation: {exc}. Failing closed to monitor 1.")
+                self.capture_manager.set_monitor(1)
+                profile.monitor_index = 1
+
+        # 2. Apply ROI to CaptureManager
+        roi = getattr(profile, "roi", None)
+        if hasattr(self, "capture_manager"):
+            if roi:
+                valid_roi, roi_err = self.capture_manager.set_roi(roi)
+                if not valid_roi:
+                    logger.warning(f"Profile ROI {roi} invalid for active monitor ({roi_err}). Resetting ROI to None.")
+                    self.capture_manager.set_roi(None)
+                    profile.roi = None
+            else:
+                self.capture_manager.set_roi(None)
+
+        # 3. Apply emergency hotkey to GlobalHotkeyManager
+        hk_str = getattr(profile, "emergency_hotkey", "F12") or "F12"
+        if hasattr(self, "hotkey_manager"):
+            hk_ok, hk_msg = self.hotkey_manager.update_hotkey(hk_str)
+            if not hk_ok:
+                logger.warning(f"Emergency hotkey '{hk_str}' failed to register ({hk_msg}). Rolled back to previous working hotkey.")
+
+        # 4. Apply Safety Config to ActionManager
+        if hasattr(self, "action_manager") and profile.safety_config:
+            self.action_manager.safety_config = profile.safety_config
+            self.action_manager.max_clicks_per_sec = profile.safety_config.max_clicks_per_second
+            self.action_manager.circuit_breaker_threshold = profile.safety_config.circuit_breaker_threshold
+
+        # 5. Clear target embedding caches
+        if hasattr(self, "vision_engine"):
+            self.vision_engine.clear_target_cache()
+
+        # 6. Refresh UI views
+        self._refresh_profile_views()
+        self._update_backend_status_ui()
+
+        return True, "PROFILE_ACTIVATED"
+
     def _on_profile_changed(self, index: int):
         if index < 0:
             return
         prof_id = self.combo_profiles.currentData()
         if prof_id:
-            self.vision_engine.clear_target_cache()
-            self.active_profile = self.db.load_profile(prof_id)
-            if self.active_profile and self.active_profile.safety_config:
-                self.action_manager.safety_config = self.active_profile.safety_config
-                self.action_manager.max_clicks_per_sec = self.active_profile.safety_config.max_clicks_per_second
-                self.action_manager.circuit_breaker_threshold = self.active_profile.safety_config.circuit_breaker_threshold
-            self._refresh_profile_views()
-            self._update_backend_status_ui()
+            prof = self.db.load_profile(prof_id)
+            if prof:
+                self.activate_profile(prof)
 
     def _refresh_profile_views(self):
         if not self.active_profile:
@@ -782,10 +837,8 @@ class MainWindow(QMainWindow):
             self.spin_roi_y.setValue(ry)
             self.spin_roi_w.setValue(rw)
             self.spin_roi_h.setValue(rh)
-            self.capture_manager.set_roi(self.active_profile.roi)
         else:
             self.radio_roi_full.setChecked(True)
-            self.capture_manager.set_roi(None)
 
         # Sync Safety Settings (FC-10)
         sc = self.active_profile.safety_config
@@ -1203,10 +1256,17 @@ class MainWindow(QMainWindow):
             imported_prof, status = ProfileBundleManager.safe_import_profile_from_zip(file_path)
             if imported_prof:
                 self.db.save_profile(imported_prof)
-                self.active_profile = imported_prof
                 self.combo_profiles.addItem(imported_prof.name, imported_prof.profile_id)
-                self.combo_profiles.setCurrentIndex(self.combo_profiles.count() - 1)
-                QMessageBox.information(self, "Import Successful", f"Profile '{imported_prof.name}' imported successfully.")
+                if status == "IMPORT_SUCCESS_GEOMETRY_REBOUND":
+                    QMessageBox.warning(
+                        self, "Import Successful (Geometry Rebound)",
+                        f"Profile '{imported_prof.name}' imported successfully.\n\n"
+                        f"Target monitor or region coordinates were out of display bounds and were "
+                        f"automatically clamped/rebound to Monitor {imported_prof.monitor_index}.\n\n"
+                        f"Please verify Region coordinates before running in Production."
+                    )
+                else:
+                    QMessageBox.information(self, "Import Successful", f"Profile '{imported_prof.name}' imported successfully.")
             else:
                 QMessageBox.critical(self, "Import Failed", status)
 

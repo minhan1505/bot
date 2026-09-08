@@ -33,7 +33,8 @@ class TargetDetailsDialog(QDialog):
 
     def __init__(self, target: Target, parent=None):
         super().__init__(parent)
-        self.target = target
+        self.original_target = target
+        self.target = target.model_copy(deep=True)
         self.setWindowTitle(f"Target Details — {target.name} ({target.target_id})")
         self.resize(850, 600)
         self._init_ui()
@@ -214,4 +215,29 @@ class TargetDetailsDialog(QDialog):
         if new_name:
             self.target.name = new_name
         self.target.enabled = self.chk_enabled.isChecked()
+
+        # Check if reference or confuser images changed (U06)
+        refs_changed = (self.target.reference_image_paths != self.original_target.reference_image_paths)
+        confs_changed = (self.target.confuser_image_paths != self.original_target.confuser_image_paths)
+
+        if refs_changed or confs_changed:
+            # Identity-defining target dataset content changed!
+            # U06 Vision Safety: Force recalibration to prevent stale calibration validity
+            self.target.calibration = None
+            logger.info(f"Target '{self.target.target_id}' references/confusers modified. Invalidation of CalibrationProfile enforced.")
+            QMessageBox.information(
+                self,
+                "Calibration Invalidated",
+                f"Target sample images were modified.\n\n"
+                f"The existing CalibrationProfile has been invalidated (calibration=None).\n"
+                f"Recalibration is required before running this target in production."
+            )
+
+        # Commit deep-copy changes back to original target
+        self.original_target.name = self.target.name
+        self.original_target.enabled = self.target.enabled
+        self.original_target.reference_image_paths = list(self.target.reference_image_paths)
+        self.original_target.confuser_image_paths = list(self.target.confuser_image_paths)
+        self.original_target.calibration = self.target.calibration
+
         self.accept()

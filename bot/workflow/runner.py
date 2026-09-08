@@ -155,10 +155,14 @@ class BotRuntimeRunner:
                 if not target_cfg or not getattr(target_cfg, "enabled", True) or not region_cfg or not target_cfg.reference_image_paths:
                     continue
 
-                # Read reference image
+                # Read all reference images for target (U05)
                 import cv2
-                ref_img = cv2.imread(target_cfg.reference_image_paths[0])
-                if ref_img is None:
+                ref_imgs = []
+                for p in target_cfg.reference_image_paths:
+                    img = cv2.imread(p)
+                    if img is not None:
+                        ref_imgs.append(img)
+                if not ref_imgs:
                     continue
 
                 r_rect = Rect(region_cfg.x, region_cfg.y, region_cfg.w, region_cfg.h)
@@ -172,9 +176,15 @@ class BotRuntimeRunner:
                     continue
 
                 region_crop = frame[ry1:ry2, rx1:rx2]
-                props = self.vision_engine.proposal_engine.generate_proposals_for_region(
-                    region_crop, r_rect, ref_img, r_id
-                )
+                props = []
+                for ref_img in ref_imgs:
+                    sub_p = self.vision_engine.proposal_engine.generate_proposals_for_region(
+                        region_crop, r_rect, ref_img, r_id
+                    )
+                    props.extend(sub_p)
+                if len(ref_imgs) > 1:
+                    from bot.vision.proposal import nms
+                    props = nms(props, iou_threshold=0.35)
                 if props:
                     proposals_by_region[r_id] = props
 
@@ -187,6 +197,24 @@ class BotRuntimeRunner:
                 for r_id, expected_target_id in scheduled_regions:
                     region_candidates = [c for c in candidates if c.region_id == r_id]
                     if not region_candidates:
+                        r_diag = diag.get(r_id, "")
+                        if "PROPOSAL_OVERFLOW" in r_diag:
+                            fault_res = DecisionResult(
+                                target_id=expected_target_id,
+                                region_id=r_id,
+                                candidate_rect=(0, 0, 0, 0),
+                                geometry_score=0.0,
+                                geometry_pass=False,
+                                embedding_similarity=0.0,
+                                embedding_pass=False,
+                                identity_margin=0.0,
+                                margin_pass=False,
+                                decision=DecisionClass.UNKNOWN,
+                                reason=f"PROPOSAL_OVERFLOW_PERFORMANCE_FAULT: proposals in region '{r_id}' truncated ({r_diag}). Recall cannot be guaranteed.",
+                                timestamp=time.time()
+                            )
+                            if self.on_decision:
+                                self.on_decision(fault_res)
                         continue
 
                     target_cfg = self.profile.targets.get(expected_target_id)
@@ -194,31 +222,49 @@ class BotRuntimeRunner:
                         continue
 
                     import cv2
-                    ref_img = cv2.imread(target_cfg.reference_image_paths[0])
-                    if ref_img is None:
+                    ref_imgs = []
+                    for p in target_cfg.reference_image_paths:
+                        img = cv2.imread(p)
+                        if img is not None:
+                            ref_imgs.append(img)
+                    if not ref_imgs:
                         continue
 
-                    # Collect competitor targets for Gate 3 Margin evaluation
+                    # Collect competitor targets for Gate 3 Margin evaluation (U05: all references)
                     alt_targets = {}
                     for other_id, other_cfg in self.profile.targets.items():
                         if other_id != expected_target_id and other_cfg.reference_image_paths:
-                            alt_img = cv2.imread(other_cfg.reference_image_paths[0])
-                            if alt_img is not None:
-                                alt_targets[other_id] = alt_img
+                            other_imgs = []
+                            for p in other_cfg.reference_image_paths:
+                                img = cv2.imread(p)
+                                if img is not None:
+                                    other_imgs.append(img)
+                            if other_imgs:
+                                alt_targets[other_id] = other_imgs
 
-                    try:
-                        if alt_targets:
-                            decisions = self.vision_engine.evaluate_candidates(
-                                frame, region_candidates, target_cfg, ref_img, alt_targets
-                            )
-                        else:
-                            decisions = self.vision_engine.evaluate_candidates(
-                                frame, region_candidates, target_cfg, ref_img
-                            )
-                    except TypeError:
-                        decisions = self.vision_engine.evaluate_candidates(
-                            frame, region_candidates, target_cfg, ref_img
+                    decisions = self.vision_engine.evaluate_candidates(
+                        frame, region_candidates, target_cfg, ref_imgs, alt_targets
+                    )
+
+                    # U07 Fail-Closed Guard: If proposal overflow occurred in this region and no candidate matched,
+                    # recall cannot be guaranteed; emit PERFORMANCE_FAULT / UNKNOWN.
+                    r_diag = diag.get(r_id, "")
+                    if "PROPOSAL_OVERFLOW" in r_diag and not any(d.decision == DecisionClass.MATCH for d in decisions):
+                        fault_res = DecisionResult(
+                            target_id=expected_target_id,
+                            region_id=r_id,
+                            candidate_rect=(0, 0, 0, 0),
+                            geometry_score=0.0,
+                            geometry_pass=False,
+                            embedding_similarity=0.0,
+                            embedding_pass=False,
+                            identity_margin=0.0,
+                            margin_pass=False,
+                            decision=DecisionClass.UNKNOWN,
+                            reason=f"PROPOSAL_OVERFLOW_PERFORMANCE_FAULT: proposals in region '{r_id}' exceeded quota ({r_diag}). Recall cannot be guaranteed.",
+                            timestamp=time.time()
                         )
+                        decisions.append(fault_res)
 
                     for res in decisions:
                         self.total_evaluations += 1

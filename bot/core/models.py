@@ -21,7 +21,6 @@ class ActionType(str, Enum):
     CLICK = "CLICK"
     DOUBLE_CLICK = "DOUBLE_CLICK"
     DETECT_ONLY = "DETECT_ONLY"
-    CUSTOM = "CUSTOM"
 
 
 class CalibrationProfile(BaseModel):
@@ -42,6 +41,7 @@ class CalibrationProfile(BaseModel):
     separation_gap: float = 0.0
     sample_count_pos: int = 0
     sample_count_neg: int = 0
+    target_content_hash: Optional[str] = None
     calibrated_at: float = Field(default_factory=time.time)
 
     def is_valid_for(
@@ -49,14 +49,20 @@ class CalibrationProfile(BaseModel):
         model_sha256: str,
         precision: str,
         canonical_size: Tuple[int, int],
-        preprocessing_version: str = "v2.3_canonical_letterbox"
+        preprocessing_version: str = "v2.3_canonical_letterbox",
+        target_content_hash: Optional[str] = None
     ) -> bool:
-        return (
+        base_valid = (
             self.model_sha256 == model_sha256
             and self.precision == precision
             and self.canonical_size == canonical_size
             and self.preprocessing_version == preprocessing_version
         )
+        if not base_valid:
+            return False
+        if self.target_content_hash is not None and target_content_hash is not None:
+            return self.target_content_hash == target_content_hash
+        return True
 
 
 class Target(BaseModel):
@@ -71,6 +77,29 @@ class Target(BaseModel):
     enabled: bool = True
     calibration: Optional[CalibrationProfile] = None
     created_at: float = Field(default_factory=time.time)
+
+    def compute_content_hash(self) -> str:
+        """Computes deterministic SHA-256 hash across target reference and confuser images (U06)."""
+        import hashlib
+        import os
+        h = hashlib.sha256()
+        for p in sorted(self.reference_image_paths):
+            h.update(f"ref:{p}".encode("utf-8"))
+            if os.path.exists(p):
+                try:
+                    with open(p, "rb") as f:
+                        h.update(f.read())
+                except Exception:
+                    pass
+        for p in sorted(self.confuser_image_paths):
+            h.update(f"conf:{p}".encode("utf-8"))
+            if os.path.exists(p):
+                try:
+                    with open(p, "rb") as f:
+                        h.update(f.read())
+                except Exception:
+                    pass
+        return h.hexdigest()
 
 
 class RegionModel(BaseModel):

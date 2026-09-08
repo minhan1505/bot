@@ -12,7 +12,7 @@ import time
 import ctypes
 from ctypes import wintypes
 import threading
-from typing import Callable, Optional
+from typing import Callable, Optional, Tuple
 import logging
 
 logger = logging.getLogger(__name__)
@@ -111,20 +111,32 @@ class GlobalHotkeyManager:
 
     def update_hotkey(self, hotkey_str: str) -> Tuple[bool, str]:
         """
-        Dynamically updates hotkey (FC-01).
+        Dynamically updates hotkey (FC-01, U02).
         Unregisters previous hotkey, registers new hotkey, and returns status.
+        If registration fails (e.g. HOTKEY_CONFLICT), safely restores the previous hotkey
+        binding so emergency stop capability is never lost.
         """
         new_vk, new_mods = parse_hotkey_string(hotkey_str)
         old_str = self.hotkey_str
+        old_vk = self.vk_code
+        old_mods = self.modifiers
+        was_alive = self.is_alive()
+
         self.hotkey_str = hotkey_str
         self.vk_code = new_vk
         self.modifiers = new_mods
 
-        if self.is_alive():
+        if was_alive:
             success, err = self.start()
             if not success:
-                logger.error(f"HOTKEY_CONFLICT: Failed to register hotkey '{hotkey_str}'. Reverting.")
+                logger.error(f"HOTKEY_CONFLICT: Failed to register hotkey '{hotkey_str}'. Reverting to '{old_str}'.")
                 self.last_error = err or "HOTKEY_CONFLICT"
+                # Revert fields to old binding
+                self.hotkey_str = old_str
+                self.vk_code = old_vk
+                self.modifiers = old_mods
+                # Re-activate old hotkey to guarantee fail-safe emergency stop remains online
+                self.start()
                 return False, self.last_error
             return True, "HOTKEY_REGISTERED"
         return True, "HOTKEY_UPDATED"
