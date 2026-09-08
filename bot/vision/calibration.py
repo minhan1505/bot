@@ -13,6 +13,7 @@ Strictly implements:
 """
 
 import numpy as np
+import hashlib
 from typing import List, Tuple, Dict, Optional
 from dataclasses import dataclass
 import logging
@@ -269,6 +270,15 @@ def calibrate_target_from_samples(
     mid_neg = max(1, len(negative_images) // 2)
     neg_calib = negative_images[:mid_neg]
     neg_val = negative_images[mid_neg:]
+
+    # Enforce zero content leakage between Session A and Session B partitions
+    calib_hashes = {hashlib.sha256(img.tobytes()).hexdigest() for img in pos_calib}
+    for img in pos_val:
+        if hashlib.sha256(img.tobytes()).hexdigest() in calib_hashes:
+            raise CalibrationOverlapError(
+                "DATA_LEAKAGE_DETECTED: Validation partition contains samples identical to calibration partition. "
+                "Calibration requires genuinely independent capture samples."
+            )
 
     d_calib = [
         EvaluationSample(image=img, is_positive=True, label=target_id, session_id="session_A", device_id="dev_0")

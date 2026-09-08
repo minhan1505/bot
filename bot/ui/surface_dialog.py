@@ -29,7 +29,7 @@ from PySide6.QtCore import Qt
 from bot.action.manager import ActionManager
 from bot.action.cdp_backend import CDPActionBackend, get_physical_cursor_pos
 from bot.action.window_backend import WindowActionBackend, WM_NCHITTEST
-from bot.core.coordinates import ViewportContext
+from bot.core.coordinates import ViewportContext, Rect
 
 logger = logging.getLogger(__name__)
 
@@ -240,16 +240,61 @@ class SurfaceVerificationDialog(QDialog):
         try:
             async def _run_active_surface_probe():
                 async with websockets.connect(ws_url, close_timeout=3.0) as ws:
-                    # 1. Query tab metadata & viewport
+                    # 1. Query tab metadata, coordinates, viewport, and discover target surface
                     script_info = """
                     (() => {
+                        const dpr = window.devicePixelRatio || 1.0;
+                        const w = window.innerWidth;
+                        const h = window.innerHeight;
+                        const sx = window.screenX !== undefined ? window.screenX : (window.screenLeft || 0);
+                        const sy = window.screenY !== undefined ? window.screenY : (window.screenTop || 0);
+                        const ow = window.outerWidth || w;
+                        const oh = window.outerHeight || h;
+                        const center_x = Math.round(w / 2);
+                        const center_y = Math.round(h / 2);
+
+                        const targetEl = document.elementFromPoint(center_x, center_y) || document.body;
+                        const rect = targetEl ? targetEl.getBoundingClientRect() : { x: 0, y: 0, width: w, height: h };
+                        const style = targetEl ? window.getComputedStyle(targetEl) : {};
+
+                        const canvases = Array.from(document.querySelectorAll('canvas')).map(c => {
+                            const r = c.getBoundingClientRect();
+                            return {
+                                id: c.id || '',
+                                className: String(c.className || ''),
+                                width: c.width,
+                                height: c.height,
+                                clientWidth: c.clientWidth,
+                                clientHeight: c.clientHeight,
+                                left: Math.round(r.left),
+                                top: Math.round(r.top)
+                            };
+                        });
+
                         return {
                             title: document.title,
                             visibility: document.visibilityState,
                             readyState: document.readyState,
-                            innerWidth: window.innerWidth,
-                            innerHeight: window.innerHeight,
-                            devicePixelRatio: window.devicePixelRatio || 1.0
+                            innerWidth: w,
+                            innerHeight: h,
+                            devicePixelRatio: dpr,
+                            screenX: Math.round(sx),
+                            screenY: Math.round(sy),
+                            outerWidth: Math.round(ow),
+                            outerHeight: Math.round(oh),
+                            scrollX: Math.round(window.scrollX || 0),
+                            scrollY: Math.round(window.scrollY || 0),
+                            targetElement: {
+                                tagName: targetEl.tagName,
+                                id: targetEl.id || '',
+                                className: String(targetEl.className || ''),
+                                rect: { x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height) },
+                                pointerEvents: style.pointerEvents || 'auto',
+                                visibility: style.visibility || 'visible',
+                                isCanvas: (targetEl.tagName.toLowerCase() === 'canvas')
+                            },
+                            canvasesCount: canvases.length,
+                            canvases: canvases
                         };
                     })()
                     """
@@ -263,20 +308,45 @@ class SurfaceVerificationDialog(QDialog):
                     if w <= 0 or h <= 0:
                         return info, False, "Viewport dimensions <= 0"
 
-                    # 2. Attach temporary probe event listener in page DOM
                     center_x = float(w // 2)
                     center_y = float(h // 2)
+
+                    # 2. Attach probe event listener directly to target application surface with capture: false
+                    # This guarantees the event traversed the layout hit-test tree to reach the target element
                     script_probe = """
                     (() => {
-                        window.__bot_probe_received = false;
-                        window.__bot_probe_x = -1;
-                        window.__bot_probe_y = -1;
-                        const handler = (e) => {
-                            window.__bot_probe_received = true;
-                            window.__bot_probe_x = Math.round(e.clientX);
-                            window.__bot_probe_y = Math.round(e.clientY);
+                        window.__bot_surface_reaction = {
+                            received: false,
+                            targetTagName: '',
+                            isCanvas: false,
+                            eventTargetMatched: false,
+                            clientX: -1,
+                            clientY: -1,
+                            rafActive: false
                         };
-                        window.addEventListener('mousemove', handler, { once: true, capture: true });
+
+                        // Verify active render loop
+                        requestAnimationFrame(() => {
+                            if (window.__bot_surface_reaction) {
+                                window.__bot_surface_reaction.rafActive = true;
+                            }
+                        });
+
+                        const center_x = Math.round(window.innerWidth / 2);
+                        const center_y = Math.round(window.innerHeight / 2);
+                        const targetEl = document.elementFromPoint(center_x, center_y) || document.body;
+
+                        const handler = (e) => {
+                            window.__bot_surface_reaction.received = true;
+                            window.__bot_surface_reaction.targetTagName = targetEl.tagName;
+                            window.__bot_surface_reaction.isCanvas = (targetEl.tagName.toLowerCase() === 'canvas');
+                            window.__bot_surface_reaction.clientX = Math.round(e.clientX);
+                            window.__bot_surface_reaction.clientY = Math.round(e.clientY);
+                            window.__bot_surface_reaction.eventTargetMatched = (e.target === targetEl || targetEl.contains(e.target));
+                        };
+
+                        // capture: false requires the event to reach the target element phase
+                        targetEl.addEventListener('mousemove', handler, { once: true, capture: false });
                         return true;
                     })()
                     """
@@ -297,14 +367,10 @@ class SurfaceVerificationDialog(QDialog):
                     await ws.send(json.dumps(move_msg))
                     await asyncio.wait_for(ws.recv(), timeout=3.0)
 
-                    # 4. Check DOM probe reaction
+                    # 4. Check target surface reaction
                     script_verify = """
                     (() => {
-                        return {
-                            received: Boolean(window.__bot_probe_received),
-                            x: window.__bot_probe_x,
-                            y: window.__bot_probe_y
-                        };
+                        return window.__bot_surface_reaction || { received: false };
                     })()
                     """
                     msg4 = {"id": 1004, "method": "Runtime.evaluate", "params": {"expression": script_verify, "returnByValue": True}}
@@ -313,7 +379,11 @@ class SurfaceVerificationDialog(QDialog):
                     reaction = res4.get("result", {}).get("result", {}).get("value", {})
 
                     probe_ok = reaction.get("received", False)
-                    return info, probe_ok, f"DOM reaction: received={probe_ok} at ({reaction.get('x')}, {reaction.get('y')})"
+                    target_tag = reaction.get("targetTagName", "")
+                    matched = reaction.get("eventTargetMatched", False)
+                    raf_ok = reaction.get("rafActive", False)
+                    diag = f"Target Surface <{target_tag}>: received={probe_ok}, matched={matched}, rafActive={raf_ok}"
+                    return info, probe_ok, diag
 
             surface_data, probe_ok, probe_msg = asyncio.run(_run_active_surface_probe())
             title = surface_data.get("title", "(untitled)")
@@ -321,18 +391,29 @@ class SurfaceVerificationDialog(QDialog):
             h = surface_data.get("innerHeight", 0)
             dpr = surface_data.get("devicePixelRatio", 1.0)
             vis = surface_data.get("visibility", "unknown")
+            sx = surface_data.get("screenX", 0)
+            sy = surface_data.get("screenY", 0)
+            ow = surface_data.get("outerWidth", w)
+            oh = surface_data.get("outerHeight", h)
+            scroll_x = surface_data.get("scrollX", 0)
+            scroll_y = surface_data.get("scrollY", 0)
+            target_info = surface_data.get("targetElement", {})
+            canvases_cnt = surface_data.get("canvasesCount", 0)
 
             self._log(f"  Target Tab Title: {title}")
             self._log(f"  Viewport: {w}x{h} CSS px, DPR: {dpr}")
+            self._log(f"  Target Element at Center: <{target_info.get('tagName')}> (isCanvas={target_info.get('isCanvas')}, pointerEvents={target_info.get('pointerEvents')})")
+            if canvases_cnt > 0:
+                self._log(f"  Detected {canvases_cnt} <canvas> element(s) in tab.")
             self._log(f"  Visibility State: {vis}")
-            self._log(f"  Active Benign Event Reaction: {probe_msg}")
+            self._log(f"  Active Surface Event Reaction: {probe_msg}")
 
             if w <= 0 or h <= 0:
                 self._log("✖ Stage 2 Failed: Viewport dimensions <= 0.")
                 return
 
             if not probe_ok:
-                self._log("✖ Stage 2 Warning: Target document did not return event reaction acknowledgment.")
+                self._log("✖ Stage 2 Warning: Target application surface did not acknowledge event delivery.")
                 return
 
             # Verify physical cursor independence
@@ -342,12 +423,24 @@ class SurfaceVerificationDialog(QDialog):
                 self._log("✖ MOUSE_INDEPENDENCE_VIOLATION: System cursor moved during probe!")
                 return
 
+            client_w = int(round(w * dpr))
+            client_h = int(round(h * dpr))
+            win_w = max(int(ow), client_w)
+            win_h = max(int(oh), client_h)
+            top_bar = max(0, oh - client_h)
+            side_border = max(0, (ow - client_w) // 2)
+            client_screen_x = int(sx + side_border)
+            client_screen_y = int(sy + top_bar)
+
+            window_rect = Rect(x=int(sx), y=int(sy), w=win_w, h=win_h)
+            client_rect = Rect(x=client_screen_x, y=client_screen_y, w=client_w, h=client_h)
+
             vp_ctx = ViewportContext(
-                origin_screen_x=0,
-                origin_screen_y=0,
-                inner_width=w,
-                inner_height=h,
-                device_pixel_ratio=dpr
+                window_rect=window_rect,
+                client_rect=client_rect,
+                viewport_offset=(0, 0),
+                device_pixel_ratio=float(dpr),
+                scroll_offset=(int(scroll_x), int(scroll_y))
             )
 
             # Persist ViewportContext directly onto backend and ActionManager
@@ -359,7 +452,7 @@ class SurfaceVerificationDialog(QDialog):
             }
             self.action_manager.probe_and_bind(backend, context)
 
-            self._log("✔ Stage 2 Passed: Target surface & active DOM event reaction verified.")
+            self._log("✔ Stage 2 Passed: Target application surface & layout hit-test event verified.")
             self._log("★ SURFACE VERIFIED: Full background production action unlocked.")
             self.lbl_status.setText("STATUS: SURFACE_VERIFIED (PRODUCTION_READY)")
             self.lbl_status.setStyleSheet("font-weight: bold; padding: 6px; background: #c8e6c9; color: #1b5e20;")

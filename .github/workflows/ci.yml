@@ -26,5 +26,7 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run complete test suite (tests and qa)
+        env:
+          QT_QPA_PLATFORM: offscreen
         run: |
           python -m pytest tests/ qa/ -v

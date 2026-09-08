@@ -336,10 +336,10 @@ Output includes the comprehensive markdown benchmark report verifying 0 samples 
 
 ## 11. Test Suite Summary
 
-- **Total Automated Tests:** 82 passed (0 failed, 0 skipped).
-  - 64 Unit & Integration Tests (`tests/`)
+- **Total Automated Tests:** 89 passed (0 failed, 0 skipped).
+  - 71 Unit & Integration Tests (`tests/`)
     - Includes `test_hardware_sla_harness.py` (live runner 19 regions SLA)
-    - Includes `test_ui_workflow_and_dialogs.py` (step dialog, reordering, production guards)
+    - Includes `test_ui_workflow_and_dialogs.py` (step dialog, reordering, production guards, dual-session zero-leakage, valid ViewportContext)
     - Includes `test_model_empirical_validation.py` (model provenance, zero-overlap, separation gap)
   - 7 Acceptance Counterexample Tests (`qa/test_ae5036a_acceptance.py`)
   - 4 Robustness Counterexample Tests (`qa/test_79168c8_followup.py`)
@@ -352,11 +352,16 @@ Output includes the comprehensive markdown benchmark report verifying 0 samples 
 ## 12. Resolution of Remaining Partial Findings (F06, F07, F08, F09)
 
 ### F06 — Target Calibration Production Flow & UI Wizard
-- **Problem:** Target creation previously assigned arbitrary fallback thresholds (`.55/.65/.05`), and runner fell back to heuristic defaults if calibration was missing. Furthermore, an earlier wizard iteration synthetically modified brightness on a single reference image to fake Session A / Session B partitions.
+- **Problem:** Target creation previously assigned arbitrary fallback thresholds (`.55/.65/.05`), and runner fell back to heuristic defaults if calibration was missing. Furthermore, an earlier wizard iteration synthetically modified brightness on a single reference image to fake Session A / Session B partitions, or allowed adding identical file copies to both sessions.
 - **Resolution:**
   - Fixed `TargetCalibrationDialog` constructor signature mismatch: unified to `(target, profile, onnx_verifier, geo_verifier, parent=None)`.
   - Completely purged synthetic brightness shifting (`*0.9 / *1.1`) and fake session IDs.
   - Implemented genuine two-session real sample acquisition: Session A ($D_{calib}$) and Session B ($D_{val}$) require independent real screen captures before calibration can proceed.
+  - **Zero Data Leakage by Path, Hash & Content:** `TargetCalibrationDialog` and `calibrate_target_from_samples` enforce:
+    1. Disjoint file paths across sessions.
+    2. Zero SHA-256 byte hash overlap between Session A and Session B.
+    3. Zero identical decoded pixel buffers (`np.array_equal`) across sessions.
+    4. Zero contradiction between positive target samples and negative confusers.
   - Mathematical pre-overlap rejection: computes target-to-confuser cross-similarity $S_{neg}$ and target self-consistency $S_{pos}$. Asserts separation gap $\delta = \min(S_{pos}) - \max(S_{neg}) > 0$.
   - Threshold selection bounds: $T_e = \min(S_{pos}) - 0.5 \cdot \delta$, $T_g = \min(G_{pos}) - 0.5 \cdot \delta_g$, $M_{safe} = 0.5 \cdot \delta$.
   - Enforced fail-closed in `_toggle_bot`: In Production mode, if any target referenced in workflow steps lacks a verified `CalibrationProfile`, execution is blocked immediately.
@@ -392,9 +397,10 @@ Output includes the comprehensive markdown benchmark report verifying 0 samples 
 ### F09 — End-to-End UI Workflows, ROI Selection & Surface Verification
 - **Problem:** Target tab binding in CDP was previously unexposed; surface probe was static; viewport context was not persisted across dispatch layers; and region-workflow bindings silently fell back to defaults.
 - **Resolution:**
-  - **Active Benign Surface Reaction Probe:** In `SurfaceVerificationDialog`, Stage 2 injects a temporary DOM event listener into the browser page, dispatches a benign `Input.dispatchMouseEvent` (`mouseMoved`) to the viewport center, verifies active DOM event listener reaction and coordinate match, and verifies physical cursor remains stationary (0px movement).
+  - **Active Surface Element Inspection & Probe:** In `SurfaceVerificationDialog`, Stage 2 discovers the target surface element under `(center_x, center_y)` (`document.elementFromPoint`), queries its computed styles, bounding client rect, and canvas presence. Attaches probe listener directly to the target application surface element with `capture: false` to prove that the event traversed Chrome's layout and hit-test engine to reach the target element. Verifies `requestAnimationFrame` render loop activity, event target match (`e.target === targetSurface || targetSurface.contains(e.target)`), and stationary physical cursor (0px deviation).
+  - **Correct ViewportContext Construction:** Constructs `ViewportContext` using valid `Rect` objects (`window_rect: Rect`, `client_rect: Rect`) with `device_pixel_ratio` and `scroll_offset`, strictly eliminating runtime `TypeError`.
   - **Explicit Browser Tab Selection:** Added `get_available_pages()` to `CDPActionBackend` querying `/json` to list all open Chrome tabs by title and URL, allowing the operator to explicitly select the target tab in the GUI rather than blindly binding to tab 0.
-  - **ViewportContext Persistence & Fail-Closed Guard:** Stored `viewport_context` directly on `CDPActionBackend` and `ActionManager`. Propagated to all action dispatch contexts. In Production mode, `CDPActionBackend` strictly rejects dispatch with `ActionDispatchStatus.NOT_SENT` if `viewport_context` is missing (1:1 coordinate fallback strictly forbidden).
+  - **ViewportContext Persistence & Fail-Closed Guard:** Stored `viewport_context` directly on `CDPActionBackend` and `ActionManager`. Propagated to all action dispatch contexts. In Production mode, `CDPActionBackend` strictly rejects dispatch with `ActionDispatchStatus.NOT_SENT` if `viewport_context` is missing (1:1 coordinate fallback strictly forbidden). Fixed `List` import and `from __future__ import annotations` in `cdp_backend.py`.
   - **Strict Region Workflow Contract:** In `MainWindow._toggle_bot`, Production mode strictly verifies that every defined region has an explicit assigned workflow with $\ge 1$ step. Completely purged silent auto-guessing of `default_wf` or auto-picking the first target in Production mode.
   - **Interactive ROI Crop & Reordering:** Visual screen ROI rubberband selection via `ScreenCropOverlay(mode="region")`; dynamic step reordering (Move Up, Move Down, Delete) in `MainWindow` with `WorkflowStepDialog`.
 - **Verification:** `tests/test_ui_workflow_and_dialogs.py`.
@@ -405,12 +411,12 @@ Output includes the comprehensive markdown benchmark report verifying 0 samples 
 ## 13. Independent CI Verification (GitHub Actions)
 
 A dedicated GitHub Actions CI pipeline is configured at [`.github/workflows/ci.yml`](file:///D:/xampp/bot/.github/workflows/ci.yml).
-- **Environment:** `windows-latest`, Python 3.10.
+- **Environment:** `windows-latest`, Python 3.12, `QT_QPA_PLATFORM: offscreen`.
 - **Triggers:** Pushes to branches `audit`, `main` and Pull Requests targeting `audit`, `main`.
 - **Workflow Steps:**
-  1. Installs repository dependencies and pytest.
-  2. Runs the full test suite: `pytest tests/ qa/ -v`.
-  3. Verifies all 82+ unit, integration, and counterexample tests without local environmental biases.
+  1. Installs repository dependencies (`requirements.txt`) and pytest.
+  2. Runs the full test suite: `python -m pytest tests/ qa/ -v`.
+  3. Verifies all 89 unit, integration, and counterexample tests without local environmental biases.
 - **Live CI Run Status:** Accessible under the GitHub repository Actions tab: `https://github.com/minhan1505/bot/actions`.
 
 

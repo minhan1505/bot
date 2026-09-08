@@ -342,3 +342,144 @@ def test_cdp_backend_viewport_context_binding_and_production_guard():
     assert res.status == ActionDispatchStatus.NOT_SENT
     assert "ViewportContext" in res.reason
 
+
+def test_target_calibration_dialog_rejects_content_leakage_between_sessions(tmp_path):
+    """Verifies TargetCalibrationDialog blocks calibration when identical content is put in Session A and B."""
+    import cv2
+    import numpy as np
+    from bot.ui.calibration_dialog import TargetCalibrationDialog
+
+    # Create two files with identical pixel contents
+    img = np.zeros((48, 48, 3), dtype=np.uint8)
+    cv2.circle(img, (24, 24), 10, (255, 255, 255), -1)
+
+    file_a = str(tmp_path / "img_session_a.png")
+    file_b = str(tmp_path / "img_session_b_copy.png")
+    cv2.imwrite(file_a, img)
+    cv2.imwrite(file_b, img) # Identical pixel content!
+
+    confuser_a = str(tmp_path / "conf_a.png")
+    confuser_b = str(tmp_path / "conf_b.png")
+    cv2.imwrite(confuser_a, np.ones((48, 48, 3), dtype=np.uint8) * 50)
+    cv2.imwrite(confuser_b, np.ones((48, 48, 3), dtype=np.uint8) * 100)
+
+    target = Target(target_id="t_leak", name="Target Leak Test")
+    profile = Profile(profile_id="p_test", name="Profile")
+    onnx_v = MagicMock()
+    geo_v = MagicMock()
+
+    dlg = TargetCalibrationDialog(target, profile, onnx_v, geo_v)
+    dlg.session_a_pos = [file_a]
+    dlg.session_b_pos = [file_b]
+    dlg.session_a_neg = [confuser_a]
+    dlg.session_b_neg = [confuser_b]
+
+    with patch("PySide6.QtWidgets.QMessageBox.critical") as mock_crit:
+        dlg._run_calibration()
+        mock_crit.assert_called_once()
+        assert "Data leakage detected" in mock_crit.call_args[0][2]
+
+
+def test_calibrate_target_from_samples_rejects_identical_samples():
+    """Verifies calibrate_target_from_samples raises CalibrationOverlapError if positive samples are duplicated."""
+    import numpy as np
+    from bot.vision.calibration import calibrate_target_from_samples, CalibrationOverlapError
+
+    img = np.zeros((48, 48, 3), dtype=np.uint8)
+    # 2 identical positive images
+    pos_samples = [img, img.copy()]
+    neg_samples = [np.ones((48, 48, 3), dtype=np.uint8) * 50, np.ones((48, 48, 3), dtype=np.uint8) * 100]
+
+    with pytest.raises(CalibrationOverlapError) as exc_info:
+        calibrate_target_from_samples(
+            target_id="t_dup",
+            target_reference_img=img,
+            positive_images=pos_samples,
+            negative_images=neg_samples,
+            alternative_identity_imgs={"alt1": neg_samples[0]},
+            geo_verifier=MagicMock(),
+            onnx_verifier=MagicMock()
+        )
+    assert "DATA_LEAKAGE_DETECTED" in str(exc_info.value)
+
+
+def test_surface_dialog_cdp_probe_constructs_valid_viewport_context():
+    """Verifies SurfaceVerificationDialog._probe_cdp creates ViewportContext with valid Rect without TypeError."""
+    from bot.ui.surface_dialog import SurfaceVerificationDialog
+    from bot.core.coordinates import ViewportContext, Rect
+    import asyncio
+    import json
+
+    action_mgr = ActionManager()
+    dlg = SurfaceVerificationDialog(action_mgr)
+    dlg.combo_cdp_tabs.addItem("Test Tab", "ws://127.0.0.1:9222/devtools/page/test")
+    dlg.combo_cdp_tabs.setCurrentIndex(dlg.combo_cdp_tabs.count() - 1)
+
+    # Mock responses for CDP probe
+    eval_resp_1 = {
+        "result": {
+            "result": {
+                "value": {
+                    "title": "Casino Table",
+                    "innerWidth": 1920,
+                    "innerHeight": 1080,
+                    "devicePixelRatio": 1.25,
+                    "screenX": 100,
+                    "screenY": 50,
+                    "outerWidth": 1920,
+                    "outerHeight": 1150,
+                    "scrollX": 0,
+                    "scrollY": 0,
+                    "targetElement": {"tagName": "CANVAS", "isCanvas": True, "pointerEvents": "auto"}
+                }
+            }
+        }
+    }
+    eval_resp_2 = {"result": {"result": {}}}
+    eval_resp_4 = {
+        "result": {
+            "result": {
+                "value": {
+                    "received": True,
+                    "targetTagName": "CANVAS",
+                    "eventTargetMatched": True,
+                    "rafActive": True
+                }
+            }
+        }
+    }
+
+    class MockWs:
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            pass
+        async def send(self, msg):
+            pass
+        async def recv(self):
+            if not hasattr(self, "_idx"):
+                self._idx = 0
+            self._idx += 1
+            if self._idx == 1:
+                return json.dumps(eval_resp_1)
+            elif self._idx == 2:
+                return json.dumps(eval_resp_2)
+            elif self._idx == 3:
+                return json.dumps({})
+            else:
+                return json.dumps(eval_resp_4)
+
+    with patch("bot.ui.surface_dialog.websockets.connect", return_value=MockWs()):
+        with patch("bot.action.cdp_backend.CDPActionBackend.probe_capability", return_value=(True, "OK")):
+            with patch("bot.ui.surface_dialog.get_physical_cursor_pos", return_value=(500, 500)):
+                dlg._probe_cdp()
+
+    assert dlg.probe_success is True
+    assert action_mgr.is_surface_verified is True
+    assert action_mgr.viewport_context is not None
+    assert isinstance(action_mgr.viewport_context, ViewportContext)
+    assert isinstance(action_mgr.viewport_context.window_rect, Rect)
+    assert isinstance(action_mgr.viewport_context.client_rect, Rect)
+    assert action_mgr.viewport_context.device_pixel_ratio == 1.25
+
+

@@ -11,6 +11,7 @@ Implements F06 Production Calibration Flow:
 """
 
 import os
+import hashlib
 import cv2
 import numpy as np
 from typing import List, Dict, Optional, Tuple
@@ -234,7 +235,17 @@ class TargetCalibrationDialog(QDialog):
         files, _ = QFileDialog.getOpenFileNames(self, f"Select Positive Sample(s) for Session {session_key}", "", "Images (*.png *.jpg *.bmp)")
         if files:
             target_list = self.session_a_pos if session_key == "A" else self.session_b_pos
+            other_list = self.session_b_pos if session_key == "A" else self.session_a_pos
             for f in files:
+                abs_f = os.path.abspath(f)
+                if any(os.path.abspath(other) == abs_f for other in other_list):
+                    QMessageBox.warning(
+                        self,
+                        "DATA_LEAKAGE_REJECTED",
+                        f"Cannot add '{os.path.basename(f)}': File is already present in Session {'B' if session_key == 'A' else 'A'}.\n"
+                        "Calibration and validation require strictly independent capture files."
+                    )
+                    continue
                 if f not in target_list:
                     target_list.append(f)
             self._refresh_tables()
@@ -252,7 +263,16 @@ class TargetCalibrationDialog(QDialog):
         files, _ = QFileDialog.getOpenFileNames(self, f"Select Confuser(s) for Session {session_key}", "", "Images (*.png *.jpg *.bmp)")
         if files:
             target_list = self.session_a_neg if session_key == "A" else self.session_b_neg
+            other_list = self.session_b_neg if session_key == "A" else self.session_a_neg
             for f in files:
+                abs_f = os.path.abspath(f)
+                if any(os.path.abspath(other) == abs_f for other in other_list):
+                    QMessageBox.warning(
+                        self,
+                        "DATA_LEAKAGE_REJECTED",
+                        f"Cannot add '{os.path.basename(f)}': Confuser file is already present in Session {'B' if session_key == 'A' else 'A'}."
+                    )
+                    continue
                 if f not in target_list:
                     target_list.append(f)
             self._refresh_tables()
@@ -279,19 +299,29 @@ class TargetCalibrationDialog(QDialog):
             )
             return
 
+        # Check file path overlap between Session A and Session B
+        pos_a_paths = {os.path.abspath(p) for p in self.session_a_pos}
+        for p in self.session_b_pos:
+            if os.path.abspath(p) in pos_a_paths:
+                QMessageBox.critical(
+                    self,
+                    "DATA_LEAKAGE_DETECTED",
+                    f"Data leakage detected: File '{os.path.basename(p)}' is present in both Session A and Session B.\n"
+                    "Calibration (D_calib) and Validation (D_val) must originate from distinct capture files."
+                )
+                return
+
         if len(self.session_a_neg) < 1 or len(self.session_b_neg) < 1:
-            # Also check if profile has alternative competitor targets to populate negatives
+            # Check if profile has distinct competitor targets to populate negatives
             competitor_imgs = []
             for oid, ot in self.profile.targets.items():
                 if oid != self.target.target_id and ot.reference_image_paths and os.path.exists(ot.reference_image_paths[0]):
                     competitor_imgs.append(ot.reference_image_paths[0])
 
-            if len(self.session_a_neg) < 1 and competitor_imgs:
+            if len(self.session_a_neg) < 1 and len(competitor_imgs) >= 1:
                 self.session_a_neg.append(competitor_imgs[0])
-            if len(self.session_b_neg) < 1 and len(competitor_imgs) > 1:
+            if len(self.session_b_neg) < 1 and len(competitor_imgs) >= 2:
                 self.session_b_neg.append(competitor_imgs[1])
-            elif len(self.session_b_neg) < 1 and len(self.session_a_neg) > 1:
-                self.session_b_neg.append(self.session_a_neg.pop())
 
             self._refresh_tables()
 
@@ -300,8 +330,19 @@ class TargetCalibrationDialog(QDialog):
                     self,
                     "MISSING_SESSION_CONFUSERS",
                     "Data-driven calibration requires at least 1 confuser/competitor sample for Session A "
-                    "and 1 for Session B to establish competitor margins.\n"
-                    "Add confuser image files to both sessions before running calibration."
+                    "and 1 distinct sample for Session B to establish competitor margins.\n"
+                    "Add distinct confuser image files to both sessions before running calibration."
+                )
+                return
+
+        # Check confuser path overlap between Session A and Session B
+        neg_a_paths = {os.path.abspath(p) for p in self.session_a_neg}
+        for p in self.session_b_neg:
+            if os.path.abspath(p) in neg_a_paths:
+                QMessageBox.critical(
+                    self,
+                    "DATA_LEAKAGE_DETECTED",
+                    f"Data leakage detected: Confuser file '{os.path.basename(p)}' is present in both Session A and Session B."
                 )
                 return
 
@@ -319,6 +360,44 @@ class TargetCalibrationDialog(QDialog):
         if not pos_a_imgs or not pos_b_imgs or not neg_a_imgs or not neg_b_imgs:
             QMessageBox.critical(self, "Image Read Error", "Failed to load image files from disk. Verify file paths.")
             return
+
+        # Check pixel content hashes across sessions (Zero Content Leakage)
+        pos_a_hashes = {hashlib.sha256(img.tobytes()).hexdigest() for img in pos_a_imgs}
+        for img in pos_b_imgs:
+            h = hashlib.sha256(img.tobytes()).hexdigest()
+            if h in pos_a_hashes:
+                QMessageBox.critical(
+                    self,
+                    "DATA_LEAKAGE_DETECTED",
+                    "Data leakage detected: A positive sample in Session B has identical pixel content "
+                    "to a sample in Session A.\nZero data leakage requires truly distinct capture sessions."
+                )
+                return
+
+        neg_a_hashes = {hashlib.sha256(img.tobytes()).hexdigest() for img in neg_a_imgs}
+        for img in neg_b_imgs:
+            h = hashlib.sha256(img.tobytes()).hexdigest()
+            if h in neg_a_hashes:
+                QMessageBox.critical(
+                    self,
+                    "DATA_LEAKAGE_DETECTED",
+                    "Data leakage detected: A confuser sample in Session B has identical pixel content "
+                    "to a confuser in Session A.\nBoth sessions require independent samples."
+                )
+                return
+
+        # Check contradiction between positive samples and confuser samples
+        all_pos_hashes = pos_a_hashes.union({hashlib.sha256(img.tobytes()).hexdigest() for img in pos_b_imgs})
+        for img in neg_a_imgs + neg_b_imgs:
+            h = hashlib.sha256(img.tobytes()).hexdigest()
+            if h in all_pos_hashes:
+                QMessageBox.critical(
+                    self,
+                    "DATA_CONTRADICTION_DETECTED",
+                    "Contradiction detected: A negative confuser sample has identical pixel content to a positive target sample.\n"
+                    "A sample cannot be both positive and negative."
+                )
+                return
 
         ref_img = pos_a_imgs[0]
 

@@ -6,11 +6,12 @@ Dispatches background mouse events directly into the browser/canvas rendering en
 without touching, seizing, or moving the physical Windows cursor.
 """
 
+from __future__ import annotations
 import json
 import urllib.request
 import asyncio
 import websockets
-from typing import Tuple, Dict, Any, Optional
+from typing import Tuple, Dict, Any, Optional, List
 import ctypes
 import logging
 from bot.action.base import BaseActionBackend, ActionDispatchResult, ActionDispatchStatus
