@@ -57,15 +57,15 @@ class CalibrationEngine:
     def calibrate_target(
         self,
         target_id: str,
-        target_reference_img: np.ndarray,
+        target_reference_img: Union[np.ndarray, List[np.ndarray]],
         d_calib: List[EvaluationSample],
         d_val: List[EvaluationSample],
-        alternative_identity_imgs: Optional[Dict[str, np.ndarray]] = None
+        alternative_identity_imgs: Optional[Dict[str, Union[np.ndarray, List[np.ndarray]]]] = None
     ) -> CalibrationProfile:
         """
         Runs rigorous calibration for a specific target.
         d_calib: Calibration set (Session A)
-        d_val: Held-out validation set (Session B)
+        d_val: Held-Out validation set (Session B)
         """
         if not d_calib:
             raise ValueError(f"Calibration set d_calib cannot be empty for target {target_id}")
@@ -99,16 +99,36 @@ class CalibrationEngine:
                 f"Identity Margin gate requires at least one competitor/confuser to establish M_safe."
             )
 
-        # Ensure target embedding is cached
-        self.onnx_verifier.cache_target_embedding(target_id, [target_reference_img])
+        # Normalize target reference images to List[np.ndarray] (W03: multi-reference alignment with runtime)
+        if isinstance(target_reference_img, list):
+            target_refs = [img for img in target_reference_img if img is not None]
+        elif target_reference_img is not None:
+            target_refs = [target_reference_img]
+        else:
+            target_refs = []
+
+        if not target_refs:
+            raise ValueError(f"Target '{target_id}' must have at least 1 valid reference image for calibration.")
+
+        # Ensure target embedding is cached across all references
+        self.onnx_verifier.cache_target_embedding(target_id, target_refs)
         target_emb = self.onnx_verifier.get_cached_target_embedding(target_id)
 
         # Cache alternative identity embeddings for margin calculation
         alt_embs: Dict[str, np.ndarray] = {}
         if alternative_identity_imgs:
-            for alt_id, alt_img in alternative_identity_imgs.items():
-                self.onnx_verifier.cache_target_embedding(alt_id, [alt_img])
-                alt_embs[alt_id] = self.onnx_verifier.get_cached_target_embedding(alt_id)
+            for alt_id, alt_val in alternative_identity_imgs.items():
+                if isinstance(alt_val, list):
+                    a_imgs = [img for img in alt_val if img is not None]
+                elif alt_val is not None:
+                    a_imgs = [alt_val]
+                else:
+                    a_imgs = []
+                if a_imgs:
+                    self.onnx_verifier.cache_target_embedding(alt_id, a_imgs)
+                    a_emb = self.onnx_verifier.get_cached_target_embedding(alt_id)
+                    if a_emb is not None:
+                        alt_embs[alt_id] = a_emb
 
         # -------------------------------------------------------------
         # STEP 1: Compute scores on D_calib (Calibration Phase)
@@ -118,8 +138,8 @@ class CalibrationEngine:
         calib_m_pos, calib_m_neg = [], []
 
         for sample in d_calib:
-            # 1. Geometry Score
-            g_score = self.geo_verifier.compute_geometry_score(sample.image, target_reference_img)
+            # 1. Geometry Score (W03: max across all references)
+            g_score = max(self.geo_verifier.compute_geometry_score(sample.image, ref) for ref in target_refs)
             # 2. Embedding Similarity
             cand_emb = self.onnx_verifier.compute_embeddings([sample.image])[0]
             e_score = self.onnx_verifier.cosine_similarity(cand_emb, target_emb)
@@ -190,7 +210,7 @@ class CalibrationEngine:
         fn_observed = 0
 
         for sample in d_val:
-            g_score = self.geo_verifier.compute_geometry_score(sample.image, target_reference_img)
+            g_score = max(self.geo_verifier.compute_geometry_score(sample.image, ref) for ref in target_refs)
             cand_emb = self.onnx_verifier.compute_embeddings([sample.image])[0]
             e_score = self.onnx_verifier.cosine_similarity(cand_emb, target_emb)
 
@@ -250,7 +270,7 @@ class CalibrationEngine:
 
 def calibrate_target_from_samples(
     target_id: str,
-    target_reference_img: np.ndarray,
+    target_reference_img: Union[np.ndarray, List[np.ndarray]],
     pos_calib: List[np.ndarray],
     neg_calib: List[np.ndarray],
     pos_val: List[np.ndarray],
@@ -259,7 +279,7 @@ def calibrate_target_from_samples(
     session_val: str,
     run_calib: str,
     run_val: str,
-    alternative_identity_imgs: Optional[Dict[str, np.ndarray]],
+    alternative_identity_imgs: Optional[Dict[str, Union[np.ndarray, List[np.ndarray]]]],
     geo_verifier: GeometryVerifier,
     onnx_verifier: ONNXVerifier,
     device_calib: str = "dev_calib",
@@ -356,10 +376,10 @@ def calibrate_target_from_samples(
 
 def calibrate_target_from_partitions(
     target_id: str,
-    target_reference_img: np.ndarray,
+    target_reference_img: Union[np.ndarray, List[np.ndarray]],
     d_calib: List[EvaluationSample],
     d_val: List[EvaluationSample],
-    alternative_identity_imgs: Optional[Dict[str, np.ndarray]],
+    alternative_identity_imgs: Optional[Dict[str, Union[np.ndarray, List[np.ndarray]]]],
     geo_verifier: GeometryVerifier,
     onnx_verifier: ONNXVerifier,
     canonical_size: Tuple[int, int] = (64, 64)

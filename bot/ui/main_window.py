@@ -667,14 +667,25 @@ class MainWindow(QMainWindow):
             return
         success, err = self.hotkey_manager.update_hotkey(hotkey_str)
         if not success:
-            QMessageBox.warning(
-                self, "HOTKEY_CONFLICT",
-                f"Failed to register global hotkey '{hotkey_str}': {err}.\nAnother application may be using this hotkey."
-            )
-            # Revert combo to current active
-            self.combo_hotkey.blockSignals(True)
-            self.combo_hotkey.setCurrentText(self.active_profile.emergency_hotkey or "F12")
-            self.combo_hotkey.blockSignals(False)
+            if err == "HOTKEY_ROLLBACK_FAILED":
+                QMessageBox.critical(
+                    self, "HOTKEY_UNBOUND",
+                    f"CRITICAL: Failed to register hotkey '{hotkey_str}' AND failed to restore previous hotkey!\n"
+                    "Emergency stop hotkey is currently UNBOUND. Select and register a valid hotkey immediately."
+                )
+                self.active_profile.emergency_hotkey = ""
+                self.combo_hotkey.blockSignals(True)
+                self.combo_hotkey.setCurrentText("")
+                self.combo_hotkey.blockSignals(False)
+            else:
+                QMessageBox.warning(
+                    self, "HOTKEY_CONFLICT",
+                    f"Failed to register global hotkey '{hotkey_str}': {err}.\nAnother application may be using this hotkey."
+                )
+                # Revert combo to current active
+                self.combo_hotkey.blockSignals(True)
+                self.combo_hotkey.setCurrentText(self.active_profile.emergency_hotkey or "F12")
+                self.combo_hotkey.blockSignals(False)
             return
 
         self.active_profile.emergency_hotkey = hotkey_str
@@ -781,15 +792,21 @@ class MainWindow(QMainWindow):
 
         # 3. Apply emergency hotkey to GlobalHotkeyManager
         hk_str = getattr(profile, "emergency_hotkey", "F12") or "F12"
-        if hasattr(self, "hotkey_manager"):
+        if hasattr(self, "hotkey_manager") and self.hotkey_manager is not None:
             hk_ok, hk_msg = self.hotkey_manager.update_hotkey(hk_str)
             if not hk_ok:
-                logger.warning(
-                    f"Emergency hotkey '{hk_str}' failed to register ({hk_msg}). "
-                    f"Rolled back to '{self.hotkey_manager.hotkey_str}'."
-                )
-                # Synchronize profile and UI to the actually registered hotkey (V03)
-                profile.emergency_hotkey = self.hotkey_manager.hotkey_str
+                if hk_msg == "HOTKEY_ROLLBACK_FAILED":
+                    logger.critical(
+                        f"Emergency hotkey '{hk_str}' and rollback both failed. Emergency hotkey is UNBOUND."
+                    )
+                    profile.emergency_hotkey = ""
+                else:
+                    logger.warning(
+                        f"Emergency hotkey '{hk_str}' failed to register ({hk_msg}). "
+                        f"Rolled back to '{self.hotkey_manager.hotkey_str}'."
+                    )
+                    # Synchronize profile and UI to the actually registered hotkey (V03)
+                    profile.emergency_hotkey = self.hotkey_manager.hotkey_str
 
         # 4. Apply Safety Config to ActionManager
         if hasattr(self, "action_manager") and profile.safety_config:
@@ -1517,6 +1534,19 @@ class MainWindow(QMainWindow):
             is_dry_run = ("Dry-Run" in mode) or is_shadow
             is_production = "Production" in mode and not is_shadow
 
+            # Check emergency hotkey registration (W02 Fail-Closed)
+            if hasattr(self, "hotkey_manager") and self.hotkey_manager is not None:
+                if getattr(self.hotkey_manager, "last_error", "") == "HOTKEY_ROLLBACK_FAILED" or (
+                    hasattr(self.hotkey_manager, "is_registered") and not self.hotkey_manager.is_registered and sys.platform == "win32"
+                ):
+                    QMessageBox.critical(
+                        self,
+                        "Execution Blocked (Fail-Closed)",
+                        "Cannot start bot: Emergency stop hotkey is NOT registered or is UNBOUND.\n"
+                        "A functional emergency stop hotkey is required before starting."
+                    )
+                    return
+
             if is_production:
                 if not getattr(self.action_manager, "is_supported", False) or not getattr(self.action_manager, "is_surface_verified", False):
                     QMessageBox.critical(
@@ -1539,6 +1569,24 @@ class MainWindow(QMainWindow):
                                     "Production mode requires verified CalibrationProfile. Run 'Calibrate...' first."
                                 )
                                 return
+
+                            # W06: Validate calibration compatibility with active model, size, and content
+                            if hasattr(self, "vision_engine") and isinstance(self.vision_engine, VisionEngine) and hasattr(self.vision_engine, "onnx_verifier"):
+                                ov = self.vision_engine.onnx_verifier
+                                if not target.calibration.is_valid_for(
+                                    model_sha256=ov.model_sha256,
+                                    precision=ov.precision,
+                                    canonical_size=self.vision_engine.canonical_size,
+                                    preprocessing_version="v2.3_canonical_letterbox",
+                                    target_content_hash=target.compute_content_hash()
+                                ):
+                                    QMessageBox.critical(
+                                        self,
+                                        "Execution Blocked (Fail-Closed)",
+                                        f"Cannot start in Production mode: Calibration for target '{step.target_id}' is INVALID "
+                                        f"for the current model or reference content.\nRe-run calibration for this target."
+                                    )
+                                    return
 
                     for r_id, reg in self.active_profile.regions.items():
                         if not reg.workflow_id:

@@ -487,7 +487,8 @@ class TargetCalibrationDialog(QDialog):
             )
             return
 
-        ref_img = pos_a_imgs[0]
+        # Training/Reference Partition: Session A (D_calib) reference images (W03)
+        ref_imgs = pos_a_imgs
 
         # Construct competitor alternative targets dictionary
         alt_imgs: Dict[str, np.ndarray] = {}
@@ -515,7 +516,7 @@ class TargetCalibrationDialog(QDialog):
             from bot.vision.calibration import calibrate_target_from_partitions
             calib_result = calibrate_target_from_partitions(
                 target_id=self.target.target_id,
-                target_reference_img=ref_img,
+                target_reference_img=ref_imgs,
                 d_calib=d_calib,
                 d_val=d_val,
                 alternative_identity_imgs=alt_imgs,
@@ -531,11 +532,10 @@ class TargetCalibrationDialog(QDialog):
             self.lbl_gap.setText(f"Separation Gap: +{calib_result.separation_gap:.4f} (PASSED Zero-Overlap)")
             self.lbl_gap.setStyleSheet("color: #2e7d32; font-weight: bold;")
 
-            # Persist real sample paths into target
-            all_pos = list(dict.fromkeys(self.session_a_pos + self.session_b_pos))
-            all_neg = list(dict.fromkeys(self.session_a_neg + self.session_b_neg))
-            self.target.reference_image_paths = all_pos
-            self.target.confuser_image_paths = all_neg
+            # Persist D_calib (Session A) samples into deployed target (W03)
+            # Session B (D_val) remains strictly held out and is never leaked into the deployed matcher
+            self.target.reference_image_paths = list(dict.fromkeys(self.session_a_pos))
+            self.target.confuser_image_paths = list(dict.fromkeys(self.session_a_neg))
             calib_result.target_content_hash = self.target.compute_content_hash()
             self.target.calibration = calib_result
 

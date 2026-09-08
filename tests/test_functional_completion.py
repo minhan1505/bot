@@ -1266,3 +1266,318 @@ def test_v05_calibration_dialog_cancel_does_not_mutate_original_target():
     assert target.reference_image_paths == ["new_ref1.png", "new_ref2.png"]
     assert target.confuser_image_paths == ["new_conf.png"]
 
+
+# ==============================================================================
+# AUDIT RESOLUTION REGRESSION TESTS (W01 - W06)
+# ==============================================================================
+
+def test_w01_runner_python_312_typing_and_import():
+    """W01 Regression: runner.py must cleanly import Tuple and use future annotations under Python 3.12."""
+    import bot.workflow.runner as runner_mod
+    assert hasattr(runner_mod, "Tuple")
+    assert "Tuple" in runner_mod.Tuple.__name__
+    ann = runner_mod.BotRuntimeRunner._save_evidence_crop_async.__annotations__
+    assert "rect" in ann
+    assert "Tuple" in str(ann["rect"]) or "tuple" in str(ann["rect"])
+
+
+def test_w02_emergency_hotkey_rollback_failure_blocks_start():
+    """W02 Regression: If hotkey registration and rollback both fail, expose HOTKEY_ROLLBACK_FAILED and block Start."""
+    from bot.ui.main_window import MainWindow
+    from PySide6.QtWidgets import QApplication
+
+    mgr = GlobalHotkeyManager(hotkey_str="F12")
+    mgr.is_registered = True
+
+    with patch.object(mgr, "start", return_value=(False, "WIN32_HOTKEY_OCCUPIED")):
+        success, err = mgr.update_hotkey("F11")
+        assert success is False
+        assert err == "HOTKEY_ROLLBACK_FAILED"
+        assert mgr.is_registered is False
+        assert mgr.last_error == "HOTKEY_ROLLBACK_FAILED"
+
+    app = QApplication.instance() or QApplication([])
+    win = MainWindow()
+    win.hotkey_manager = mgr
+    win.combo_mode.setCurrentText("Production Background Action")
+
+    with patch("PySide6.QtWidgets.QMessageBox.critical") as mock_crit:
+        win._toggle_bot()
+        mock_crit.assert_called_once()
+        assert "UNBOUND" in mock_crit.call_args[0][2]
+        assert win.runner is None or not win.runner.is_running
+
+
+def test_w03_calibration_multi_reference_scoring_and_strict_dval_holdout(tmp_path):
+    """W03 Regression: Calibration evaluates multi-reference geometry (max) & embedding, and keeps D_val strictly held out."""
+    from bot.vision.geometry import GeometryVerifier
+    from bot.vision.onnx_verifier import ONNXVerifier
+    from bot.vision.calibration import CalibrationEngine, EvaluationSample, CalibrationOverlapError
+    from bot.ui.calibration_dialog import TargetCalibrationDialog
+    from PySide6.QtWidgets import QApplication
+
+    geo_v = GeometryVerifier(canonical_size=(64, 64))
+    onnx_v = ONNXVerifier(MODEL_PATH, canonical_size=(64, 64))
+
+    ref1 = np.zeros((64, 64, 3), dtype=np.uint8)
+    cv2.circle(ref1, (32, 32), 20, (255, 255, 255), -1)  # Circle
+
+    ref2 = np.zeros((64, 64, 3), dtype=np.uint8)
+    cv2.rectangle(ref2, (10, 10), (54, 54), (255, 255, 255), -1)  # Square
+
+    pos_sample_square = np.zeros((64, 64, 3), dtype=np.uint8)
+    cv2.rectangle(pos_sample_square, (12, 12), (52, 52), (255, 255, 255), -1)
+
+    conf_sample = np.zeros((64, 64, 3), dtype=np.uint8)
+    pts = np.array([[32, 10], [10, 54], [54, 54]], np.int32)
+    cv2.fillPoly(conf_sample, [pts], (255, 255, 255))
+
+    engine = CalibrationEngine(geo_v, onnx_v)
+
+    d_calib = [
+        EvaluationSample(image=pos_sample_square, is_positive=True, label="target_sq", session_id="s1", device_id="d1", run_id="r1"),
+        EvaluationSample(image=conf_sample, is_positive=False, label="confuser", session_id="s1", device_id="d1", run_id="r1")
+    ]
+    d_val = [
+        EvaluationSample(image=pos_sample_square, is_positive=True, label="target_sq", session_id="s2", device_id="d2", run_id="r2"),
+        EvaluationSample(image=conf_sample, is_positive=False, label="confuser", session_id="s2", device_id="d2", run_id="r2")
+    ]
+
+    # Single ref1 fails geometry separation because pos_sample_square does not match circle
+    with pytest.raises(CalibrationOverlapError):
+        engine.calibrate_target("target_sq", ref1, d_calib, d_val, alternative_identity_imgs={"c": conf_sample})
+
+    # Multi-reference [ref1, ref2] succeeds because max(geo(sample, ref1), geo(sample, ref2)) matches ref2
+    calib_prof = engine.calibrate_target(
+        "target_sq",
+        [ref1, ref2],
+        d_calib,
+        d_val,
+        alternative_identity_imgs={"c": conf_sample}
+    )
+    assert calib_prof.t_g > 0.0
+    assert calib_prof.separation_gap > 0.0
+
+    # Verify TargetCalibrationDialog D_val strict hold-out
+    p_pos_a = str(tmp_path / "pos_a.png")
+    p_pos_b = str(tmp_path / "pos_b.png")
+    p_neg_a = str(tmp_path / "neg_a.png")
+    p_neg_b = str(tmp_path / "neg_b.png")
+    cv2.imwrite(p_pos_a, pos_sample_square)
+    cv2.imwrite(p_pos_b, ref2)
+    cv2.imwrite(p_neg_a, conf_sample)
+    cv2.imwrite(p_neg_b, ref1)
+
+    tgt = Target(target_id="tgt_holdout", name="Holdout Target", reference_image_paths=[p_pos_a])
+    prof = Profile(profile_id="p_holdout", name="Holdout Profile", targets={"tgt_holdout": tgt})
+    app = QApplication.instance() or QApplication([])
+    dlg = TargetCalibrationDialog(tgt, prof, onnx_v, geo_v)
+    dlg.session_a_pos = [p_pos_a]
+    dlg.session_b_pos = [p_pos_b]
+    dlg.session_a_neg = [p_neg_a]
+    dlg.session_b_neg = [p_neg_b]
+    dlg.txt_session_a.setText("2026-09-08_site_session_a_lab")
+    dlg.txt_session_b.setText("2026-09-08_site_session_b_field")
+    dlg.txt_run_a.setText("run_a_001_calib")
+    dlg.txt_run_b.setText("run_b_001_val")
+
+    with patch("PySide6.QtWidgets.QMessageBox.information"):
+        dlg._run_calibration()
+
+    # D_val invariant: Deployed references must be ONLY Session A paths; Session B remains strictly held out
+    assert dlg.target.reference_image_paths == [p_pos_a]
+    assert p_pos_b not in dlg.target.reference_image_paths
+
+
+def test_w04_explicit_confusers_included_in_initial_gate3_margin(tmp_path):
+    """W04 Regression: Explicit target confusers are included in initial Gate-3 competitor set, rejecting confusers."""
+    from bot.vision.engine import VisionEngine
+    from bot.vision.geometry import GeometryVerifier
+    from bot.vision.onnx_verifier import ONNXVerifier
+    from bot.vision.proposal import CandidateProposal
+    from bot.core.coordinates import Rect
+
+    geo_v = GeometryVerifier((64, 64))
+    onnx_v = ONNXVerifier(MODEL_PATH, canonical_size=(64, 64))
+    engine = VisionEngine(onnx_verifier=onnx_v, geometry_verifier=geo_v, canonical_size=(64, 64))
+
+    tgt_img = np.zeros((64, 64, 3), dtype=np.uint8)
+    cv2.circle(tgt_img, (32, 32), 20, (255, 255, 255), -1)
+    p_tgt = str(tmp_path / "tgt.png")
+    cv2.imwrite(p_tgt, tgt_img)
+
+    conf_img = np.zeros((64, 64, 3), dtype=np.uint8)
+    cv2.rectangle(conf_img, (10, 10), (54, 54), (255, 255, 255), -1)
+    p_conf = str(tmp_path / "conf.png")
+    cv2.imwrite(p_conf, conf_img)
+
+    calib = CalibrationProfile(
+        created_at=time.time(),
+        sample_count=2,
+        separation_gap=0.3,
+        model_name="test",
+        model_sha256=onnx_v.model_sha256,
+        precision=onnx_v.precision,
+        canonical_size=(64, 64),
+        t_g=0.5,
+        t_e=0.6,
+        m_safe=0.1,
+        target_content_hash=""
+    )
+
+    t1 = Target(
+        target_id="t1",
+        name="Target 1",
+        reference_image_paths=[p_tgt],
+        confuser_image_paths=[p_conf],
+        calibration=calib
+    )
+    t1.calibration.target_content_hash = t1.compute_content_hash()
+
+    frame = np.zeros((200, 200, 3), dtype=np.uint8)
+    frame[10:74, 10:74] = conf_img
+    candidate = CandidateProposal(rect=Rect(10, 10, 64, 64), strategy="contour", score=0.9)
+
+    alt_targets = {"t1_confuser_0": [conf_img]}
+    decisions = engine.evaluate_candidates(frame, [candidate], t1, [tgt_img], alt_targets)
+
+    assert len(decisions) == 1
+    # Gate 3 must evaluate against confuser and NOT produce MATCH
+    assert decisions[0].decision != DecisionClass.MATCH
+
+
+def test_w05_portable_zip_content_hash_preserves_calibration_validity(tmp_path):
+    """W05 Regression: Target.compute_content_hash is path-independent, preserving calibration validity across ZIP export/import."""
+    from bot.core.bundle import ProfileBundleManager
+
+    dir_a = tmp_path / "dir_a"
+    dir_a.mkdir()
+
+    img_ref = np.zeros((64, 64, 3), dtype=np.uint8)
+    cv2.circle(img_ref, (32, 32), 16, (200, 200, 200), -1)
+    p_ref = str(dir_a / "ref.png")
+    cv2.imwrite(p_ref, img_ref)
+
+    img_conf = np.zeros((64, 64, 3), dtype=np.uint8)
+    cv2.rectangle(img_conf, (8, 8), (56, 56), (150, 150, 150), -1)
+    p_conf = str(dir_a / "conf.png")
+    cv2.imwrite(p_conf, img_conf)
+
+    target = Target(
+        target_id="target_zip",
+        name="Zip Target",
+        reference_image_paths=[p_ref],
+        confuser_image_paths=[p_conf]
+    )
+    initial_hash = target.compute_content_hash()
+
+    calib = CalibrationProfile(
+        created_at=time.time(),
+        sample_count=4,
+        separation_gap=0.4,
+        model_name="test_model",
+        model_sha256="test_sha_123",
+        precision="FP32",
+        canonical_size=(64, 64),
+        t_g=0.5,
+        t_e=0.6,
+        m_safe=0.05,
+        target_content_hash=initial_hash
+    )
+    target.calibration = calib
+    assert target.calibration.is_valid_for("test_sha_123", "FP32", (64, 64), target_content_hash=target.compute_content_hash())
+
+    profile = Profile(
+        profile_id="prof_zip_test",
+        name="Zip Portable Profile",
+        targets={"target_zip": target}
+    )
+
+    zip_path = str(tmp_path / "portable_bundle.zip")
+    ProfileBundleManager.export_profile_to_zip(profile, zip_path)
+
+    dest_dir = str(tmp_path / "dir_b_imported")
+    imported_prof, err = ProfileBundleManager.safe_import_profile_from_zip(zip_path, dest_targets_dir=dest_dir)
+    assert "SUCCESS" in err
+    assert imported_prof is not None
+
+    imported_target = imported_prof.targets["target_zip"]
+    assert imported_target.reference_image_paths[0] != p_ref
+    assert os.path.exists(imported_target.reference_image_paths[0])
+
+    # W05 Invariant: Content hash remains identical and calibration remains valid
+    imported_hash = imported_target.compute_content_hash()
+    assert imported_hash == initial_hash
+    assert imported_target.calibration.is_valid_for(
+        "test_sha_123", "FP32", (64, 64),
+        target_content_hash=imported_target.compute_content_hash()
+    )
+
+
+def test_w06_invalid_calibration_blocks_start_and_caught_in_runner_as_safe_pause(tmp_path):
+    """W06 Regression: Invalid calibration blocks Production Start, and in runner transitions region to SAFE_PAUSE without thread death."""
+    from bot.vision.engine import VisionEngine
+    from bot.vision.geometry import GeometryVerifier
+    from bot.vision.onnx_verifier import ONNXVerifier
+    from bot.ui.main_window import MainWindow
+    from PySide6.QtWidgets import QApplication
+
+    geo_v = GeometryVerifier((64, 64))
+    onnx_v = ONNXVerifier(MODEL_PATH, canonical_size=(64, 64))
+    engine = VisionEngine(onnx_verifier=onnx_v, geometry_verifier=geo_v, canonical_size=(64, 64))
+
+    tgt_img = np.zeros((64, 64, 3), dtype=np.uint8)
+    p_tgt = str(tmp_path / "tgt_w06.png")
+    cv2.imwrite(p_tgt, tgt_img)
+
+    calib = CalibrationProfile(
+        created_at=time.time(),
+        sample_count=2,
+        separation_gap=0.3,
+        model_name="test",
+        model_sha256=onnx_v.model_sha256,
+        precision=onnx_v.precision,
+        canonical_size=(64, 64),
+        t_g=0.5,
+        t_e=0.6,
+        m_safe=0.05,
+        target_content_hash="tampered_stale_hash_mismatch"
+    )
+    t1 = Target(target_id="t1", name="Target 1", reference_image_paths=[p_tgt], calibration=calib)
+    r1 = RegionModel(region_id="r1", name="R1", x=0, y=0, w=100, h=100, workflow_id="wf1")
+    wf1 = Workflow(workflow_id="wf1", name="WF1", steps=[WorkflowStep(step_index=0, target_id="t1")])
+
+    profile = Profile(
+        profile_id="p_w06",
+        name="W06 Profile",
+        targets={"t1": t1},
+        regions={"r1": r1},
+        workflows={"wf1": wf1}
+    )
+
+    # Part 1: MainWindow._toggle_bot blocks start in Production mode
+    app = QApplication.instance() or QApplication([])
+    win = MainWindow()
+    win.active_profile = profile
+    win.vision_engine = engine
+    win.hotkey_manager.is_registered = True
+    win.hotkey_manager.last_error = ""
+    win.action_manager = MagicMock(is_supported=True, is_surface_verified=True)
+    win.combo_mode.setCurrentText("Production Background Action")
+
+    with patch("PySide6.QtWidgets.QMessageBox.critical") as mock_crit:
+        win._toggle_bot()
+        mock_crit.assert_called_once()
+        assert "INVALID" in mock_crit.call_args[0][2]
+        assert win.runner is None or not win.runner.is_running
+
+    # Part 2: evaluate_candidates raises CALIBRATION_INVALID on invalid calibration
+    from bot.vision.proposal import CandidateProposal
+    from bot.core.coordinates import Rect
+    frame = np.zeros((200, 200, 3), dtype=np.uint8)
+    cand = CandidateProposal(rect=Rect(10, 10, 64, 64), strategy="test", score=0.9)
+    with pytest.raises(ValueError) as excinfo:
+        engine.evaluate_candidates(frame, [cand], t1, [tgt_img], None)
+    assert "CALIBRATION_INVALID" in str(excinfo.value)
+
+

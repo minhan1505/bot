@@ -130,7 +130,7 @@ D:\xampp\bot\
     ├── test_bundle.py
     ├── test_calibration_and_engine.py
     ├── test_coordinates.py
-    ├── test_functional_completion.py        # FC-01..FC-13, U01..U08, V01..V05 test suite
+    ├── test_functional_completion.py        # FC-01..FC-13, U01..U10, V01..V06, W01..W06 test suite
     ├── test_geometry.py
     ├── test_hardware_sla_harness.py
     ├── test_model_empirical_validation.py
@@ -166,13 +166,13 @@ D:\xampp\bot\
 
 ## Running the Automated Test Suite
 
-Execute the complete automated test suite (123 tests):
+Execute the complete automated test suite (129 tests):
 ```powershell
 python -m pytest tests/ qa/ -v
 ```
 
-All 123 tests execute deterministically and pass with zero failures:
-- `test_functional_completion.py`: Verifies FC-01 through FC-13, U01 through U08, and V01 through V05.
+All 129 tests execute deterministically and pass with zero failures:
+- `test_functional_completion.py`: Verifies FC-01 through FC-13, U01..U10, V01..V06, and W01..W06.
 - `test_action_and_safety.py`: Verifies Fail-Closed, Anti-Runaway, Circuit Breaker, Freshness tri-gate.
 - `test_calibration_and_engine.py`: Verifies Zero Data Leakage partitioned calibration and Tri-Condition gate.
 - `test_bundle.py`: Verifies ZIP export/import with Zip Slip security defense and confuser preservation.

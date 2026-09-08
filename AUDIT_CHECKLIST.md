@@ -475,3 +475,17 @@ The 15 Functional Completion items requested in GitHub comment `5581209834` (PR 
 | **V05** | **P1** | **Calibration Wizard Deep-Copy Staging & Safe Cancel:** In `bot/ui/calibration_dialog.py`, `TargetCalibrationDialog` operates on a deep copy (`target.model_copy(deep=True)`). Modifications are staged and only committed to the live target upon `Accept`. Clicking `Cancel` or `reject()` leaves the original target completely untouched. | `tests/test_functional_completion.py::test_v05_*` |
 | **V06** | **P2** | **Documentation & Test Suite Synchronization:** Synchronized test counts across `README.md`, `AUDIT_CHECKLIST.md`, and PR #1 body to exact current suite (123 tests passing). Verified runtime proposal wiring to 128. | `tests/test_functional_completion.py` |
 
+---
+
+## 18. Re-Audit Hardening Matrix (W01 → W06)
+
+| Finding | Severity | Resolution Details | Test Evidence |
+|---|---|---|---|
+| **W01** | **P0/P1** | **Python 3.12 Typing & Import:** Added `from __future__ import annotations` and imported `Tuple, Any, Union` from `typing` in `bot/workflow/runner.py`. Verified clean import and annotations under Python 3.12+. | `tests/test_functional_completion.py::test_w01_*` |
+| **W02** | **P0** | **Emergency Hotkey Rollback Verification & Unbound Fail-Closed:** In `bot/core/hotkey.py`, captured rollback registration result in `update_hotkey()`. If rollback also fails, returns `(False, "HOTKEY_ROLLBACK_FAILED")` and sets `is_registered=False`. In `bot/ui/main_window.py`, unbinds profile hotkey and strictly blocks bot startup (`_toggle_bot`) with fail-closed dialog. | `tests/test_functional_completion.py::test_w02_*` |
+| **W03** | **P0/P1** | **Multi-Reference Calibration Alignment & Strict D_val Holdout:** Updated `CalibrationEngine.calibrate_target()` in `bot/vision/calibration.py` to evaluate geometry (`max`) and embedding average across all reference images, identically to runtime. In `bot/ui/calibration_dialog.py`, deployed target reference bank uses `session_a_pos` (D_calib) only. Session B (`session_b_pos`, D_val) remains strictly held out and is never leaked into the deployed matcher. | `tests/test_functional_completion.py::test_w03_*` |
+| **W04** | **P1** | **Explicit Target Confusers in Initial Gate-3 Margin:** In `bot/workflow/runner.py`, loaded `target_cfg.confuser_image_paths` directly into initial `alt_targets` alongside other targets. Initial `VisionEngine.evaluate_candidates()` compares candidate against explicit confusers, preventing confuser crops from falsely passing as MATCH before fresh verify. | `tests/test_functional_completion.py::test_w04_*` |
+| **W05** | **P1** | **Path-Independent Content Hashing & Portable Calibrated ZIP:** In `bot/core/models.py`, `Target.compute_content_hash()` computes canonical SHA-256 over image byte hashes and roles (`ref:` vs `conf:`) without absolute file paths. Moving profiles or extracting ZIP bundles across machines preserves exact content hash and calibration validity. | `tests/test_functional_completion.py::test_w05_*` |
+| **W06** | **P1/P2** | **Calibration Compatibility Pre-Check & Controlled SAFE_PAUSE:** In `MainWindow._toggle_bot()`, validates `target.calibration.is_valid_for(...)` against active model SHA and content hash before starting Production mode. In `BotRuntimeRunner.run()`, wrapped `evaluate_candidates()` in `try...except ValueError` catching `CALIBRATION_INVALID`, transitioning the region to `SAFE_PAUSE` with diagnostic fault evidence without killing the worker thread. | `tests/test_functional_completion.py::test_w06_*` |
+
+

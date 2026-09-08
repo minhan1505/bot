@@ -8,11 +8,12 @@ Executes the unified live pipeline:
 Runs on a background thread to ensure GUI remains 100% responsive.
 """
 
+from __future__ import annotations
 import os
 import cv2
 import time
 import threading
-from typing import Dict, Optional, Callable, List
+from typing import Dict, Optional, Callable, List, Tuple, Any, Union
 import numpy as np
 import logging
 
@@ -230,8 +231,8 @@ class BotRuntimeRunner:
                     if not ref_imgs:
                         continue
 
-                    # Collect competitor targets for Gate 3 Margin evaluation (U05: all references)
-                    alt_targets = {}
+                    # Collect competitor targets for Gate 3 Margin evaluation (U05/W04: all references + explicit confusers)
+                    alt_targets: Dict[str, List[np.ndarray]] = {}
                     for other_id, other_cfg in self.profile.targets.items():
                         if other_id != expected_target_id and other_cfg.reference_image_paths:
                             other_imgs = []
@@ -242,9 +243,42 @@ class BotRuntimeRunner:
                             if other_imgs:
                                 alt_targets[other_id] = other_imgs
 
-                    decisions = self.vision_engine.evaluate_candidates(
-                        frame, region_candidates, target_cfg, ref_imgs, alt_targets
-                    )
+                    # W04: Include explicit target confusers in initial Gate-3 competitor set
+                    if target_cfg.confuser_image_paths:
+                        for c_idx, c_path in enumerate(target_cfg.confuser_image_paths):
+                            c_img = cv2.imread(c_path)
+                            if c_img is not None:
+                                alt_targets[f"{expected_target_id}_confuser_{c_idx}"] = [c_img]
+
+                    try:
+                        decisions = self.vision_engine.evaluate_candidates(
+                            frame, region_candidates, target_cfg, ref_imgs, alt_targets
+                        )
+                    except ValueError as calib_err:
+                        if "CALIBRATION_INVALID" in str(calib_err):
+                            logger.error(f"Region {r_id}: Calibration invalid for target '{expected_target_id}': {calib_err}")
+                            fault_res = DecisionResult(
+                                target_id=expected_target_id,
+                                region_id=r_id,
+                                candidate_rect=(0, 0, 0, 0),
+                                geometry_score=0.0,
+                                geometry_pass=False,
+                                embedding_similarity=0.0,
+                                embedding_pass=False,
+                                identity_margin=0.0,
+                                margin_pass=False,
+                                decision=DecisionClass.UNKNOWN,
+                                reason=f"CALIBRATION_INVALID: {calib_err}",
+                                timestamp=time.time()
+                            )
+                            decisions = [fault_res]
+                            inst = self.ledger.get_instance(r_id)
+                            if inst:
+                                inst.transition_to(RegionState.SAFE_PAUSE, reason=f"CALIBRATION_INVALID: {calib_err}")
+                                if self.on_state_change:
+                                    self.on_state_change(r_id, "SAFE_PAUSE", inst.current_step_index)
+                        else:
+                            raise
 
                     # U07 Fail-Closed Guard: If proposal overflow occurred in this region and no candidate matched,
                     # recall cannot be guaranteed; emit PERFORMANCE_FAULT / UNKNOWN.

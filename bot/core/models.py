@@ -79,26 +79,33 @@ class Target(BaseModel):
     created_at: float = Field(default_factory=time.time)
 
     def compute_content_hash(self) -> str:
-        """Computes deterministic SHA-256 hash across target reference and confuser images (U06)."""
+        """Computes deterministic, path-independent SHA-256 hash across target reference and confuser image contents (W05)."""
         import hashlib
         import os
         h = hashlib.sha256()
-        for p in sorted(self.reference_image_paths):
-            h.update(f"ref:{p}".encode("utf-8"))
+
+        ref_hashes = []
+        for p in self.reference_image_paths:
             if os.path.exists(p):
                 try:
                     with open(p, "rb") as f:
-                        h.update(f.read())
+                        ref_hashes.append(hashlib.sha256(f.read()).hexdigest())
                 except Exception:
                     pass
-        for p in sorted(self.confuser_image_paths):
-            h.update(f"conf:{p}".encode("utf-8"))
+        for r_hash in sorted(ref_hashes):
+            h.update(f"ref:{r_hash}".encode("utf-8"))
+
+        conf_hashes = []
+        for p in self.confuser_image_paths:
             if os.path.exists(p):
                 try:
                     with open(p, "rb") as f:
-                        h.update(f.read())
+                        conf_hashes.append(hashlib.sha256(f.read()).hexdigest())
                 except Exception:
                     pass
+        for c_hash in sorted(conf_hashes):
+            h.update(f"conf:{c_hash}".encode("utf-8"))
+
         return h.hexdigest()
 
 

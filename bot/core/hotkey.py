@@ -126,17 +126,25 @@ class GlobalHotkeyManager:
         self.vk_code = new_vk
         self.modifiers = new_mods
 
-        if was_alive:
+        if was_alive or self.is_registered:
             success, err = self.start()
             if not success:
                 logger.error(f"HOTKEY_CONFLICT: Failed to register hotkey '{hotkey_str}'. Reverting to '{old_str}'.")
-                self.last_error = err or "HOTKEY_CONFLICT"
                 # Revert fields to old binding
                 self.hotkey_str = old_str
                 self.vk_code = old_vk
                 self.modifiers = old_mods
                 # Re-activate old hotkey to guarantee fail-safe emergency stop remains online
-                self.start()
+                rollback_success, rollback_err = self.start()
+                if not rollback_success:
+                    self.is_registered = False
+                    self.last_error = "HOTKEY_ROLLBACK_FAILED"
+                    logger.critical(
+                        f"HOTKEY_UNBOUND: Both new hotkey '{hotkey_str}' and original hotkey '{old_str}' failed registration. "
+                        f"Rollback error: {rollback_err}"
+                    )
+                    return False, "HOTKEY_ROLLBACK_FAILED"
+                self.last_error = err or "HOTKEY_CONFLICT"
                 return False, self.last_error
             return True, "HOTKEY_REGISTERED"
         return True, "HOTKEY_UPDATED"
