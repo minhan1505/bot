@@ -16,7 +16,7 @@ BotAutoClick V2.3 is a clean-slate, production-grade automation system designed 
 2. **Zero Heuristic Thresholds:** Data-driven calibration with Pre-Overlap Rejection on independent sets.
 3. **Strict Mouse Independence:** No moving or locking the physical cursor; fail-closed on background action failure.
 4. **Hard SLA Latency:** Strictly $\le 700\text{ ms}$ on Declared Supported Workload (up to 19 concurrent regions).
-5. **Fail-Safe & Anti-Runaway:** F12 global emergency stop, hardware-bound licensing, and Zip Slip protection.
+5. **Fail-Safe & Anti-Runaway:** F12 global emergency stop, profile validation, and Zip Slip protection.
 
 ---
 
@@ -120,17 +120,16 @@ Please audit the implementation against the following 7 core modules and verific
 
 ---
 
-### Checklist Item 7: Security, Safety & Licensing
-- **Module:** [`bot/core/bundle.py`](file:///D:/xampp/bot/bot/core/bundle.py), [`bot/core/licensing.py`](file:///D:/xampp/bot/bot/core/licensing.py), [`bot/core/hotkey.py`](file:///D:/xampp/bot/bot/core/hotkey.py)
+### Checklist Item 7: Security & Safety
+- **Module:** [`bot/core/bundle.py`](file:///D:/xampp/bot/bot/core/bundle.py), [`bot/core/hotkey.py`](file:///D:/xampp/bot/bot/core/hotkey.py)
 - **Invariant:**
   - Resilient against path traversal, tampering, and unresponsive UI loops.
 - **Verification Points:**
   - `bundle.py`: Validates ZIP entries against `os.path.commonpath` to block Zip Slip attacks.
-  - `licensing.py`: Derives machine ID from Windows `MachineGuid` and verifies cryptographically signed HMAC-SHA256 licenses.
   - `hotkey.py`: Dedicated background Win32 message pump for **F12** global emergency stop, operational even if GUI is frozen or minimized.
 - **Automated Test:**
   ```powershell
-  python -m pytest tests/test_bundle.py tests/test_licensing.py -v -s
+  python -m pytest tests/test_bundle.py -v -s
   ```
 
 ---
@@ -336,8 +335,8 @@ Output includes the comprehensive markdown benchmark report verifying 0 samples 
 
 ## 11. Test Suite Summary
 
-- **Total Automated Tests:** 101 passed (0 failed, 0 skipped).
-  - 83 Unit & Integration Tests (`tests/`)
+- **Total Automated Tests:** 96 passed (0 failed, 0 skipped).
+  - 78 Unit & Integration Tests (`tests/`)
     - Includes `test_hardware_sla_harness.py` (live runner 19 regions SLA)
     - Includes `test_ui_workflow_and_dialogs.py` (step dialog, reordering, production guards, dual-session zero-leakage, quad-condition probe gate, High-DPI coordinate scaling, window movement & freshness invalidation, ActionManager production freshness verification)
     - Includes `test_coordinates.py` (canonical coordinates, CDP viewport vs document scroll coordinates)
@@ -423,9 +422,9 @@ A dedicated GitHub Actions CI pipeline is configured at [`.github/workflows/ci.y
 - **Workflow Steps:**
   1. Installs repository dependencies (`requirements.txt`) and pytest.
   2. Runs the full test suite: `python -m pytest tests/ qa/ -v`.
-  3. Verifies all 101 unit, integration, and counterexample tests without local environmental biases.
+  3. Verifies all 96 unit, integration, and counterexample tests without local environmental biases.
 - **Live CI Run Status:** Accessible under the GitHub repository Actions tab: `https://github.com/minhan1505/bot/actions`.
   > [!NOTE]
-  > **GitHub Actions Account Status:** Remote CI runs on GitHub Actions for repository `minhan1505/bot` currently fail at pre-step initialization due to an account-level runner billing suspension on the `minhan1505` account (`The job was not started because your account is locked due to a billing issue`). This is an external account runner quota lock, not a code or test failure. The full test suite of 101 tests passes deterministically in clean environments.
+  > **GitHub Actions Account Status:** Remote CI runs on GitHub Actions for repository `minhan1505/bot` currently fail at pre-step initialization due to an account-level runner billing suspension on the `minhan1505` account (`The job was not started because your account is locked due to a billing issue`). This is an external account runner quota lock, not a code or test failure. The full test suite of 96 tests passes deterministically in clean environments.
 
 

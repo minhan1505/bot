@@ -32,7 +32,6 @@ A clean-room, generic, multi-table desktop automation bot engineered in accordan
    - Global Emergency Stop hotkey (**F12**) via Win32 `RegisterHotKey`.
    - Anti-Runaway rate limiter and automated circuit breaker.
    - Profile ZIP export and safe import with **Zip Slip / Path Traversal** protection.
-   - Cryptographic **HMAC-SHA256** machine-bound licensing (`license.dat`).
 
 ---
 
@@ -54,7 +53,6 @@ D:\xampp\bot\
 │   │   ├── models.py                        # Pydantic Schemas: Target, Region, Workflow, CalibrationProfile, Decision
 │   │   ├── database.py                      # SQLite persistence (Profiles, Audit Logs)
 │   │   ├── bundle.py                        # ZIP Profile Export/Import with Zip Slip defense
-│   │   ├── licensing.py                     # Machine HWID derivation & HMAC-SHA256 signature verification
 │   │   └── hotkey.py                        # Global Emergency Hotkey (F12) message pump
 │   ├── capture/
 │   │   ├── base.py                          # Abstract BaseCapture interface
@@ -84,13 +82,12 @@ D:\xampp\bot\
 │       ├── crop_overlay.py                  # Physical-pixel screen crop overlay dialog
 │       ├── tray.py                          # Windows System Tray manager
 │       └── main_window.py                   # PySide6 Desktop GUI Dashboard
-└── tests/                                   # Complete Automated Test Suite (31 tests)
+└── tests/                                   # Complete Automated Test Suite
     ├── test_action_and_safety.py
     ├── test_bundle.py
     ├── test_calibration_and_engine.py
     ├── test_coordinates.py
     ├── test_geometry.py
-    ├── test_licensing.py
     ├── test_onnx_verifier.py
     ├── test_proposal.py
     ├── test_runner.py
@@ -122,18 +119,17 @@ D:\xampp\bot\
 
 ## Running the Automated Test Suite
 
-Execute all 31 unit, integration, and benchmark tests:
+Execute the complete automated test suite:
 ```powershell
 pytest -v -s
 ```
 
-All 31 test suites run in under 3 seconds with zero failures:
+All test suites run in under 30 seconds with zero failures:
 - `test_action_and_safety.py` (Fail-Closed, Anti-Runaway, Circuit Breaker, Hotkey)
 - `test_bundle.py` (ZIP export/import, Zip Slip security defense)
 - `test_calibration_and_engine.py` (Pre-overlap rejection, Tri-Condition gate)
 - `test_coordinates.py` (CoordinateMapper multidimensional scaling)
 - `test_geometry.py` (Chamfer score, separability guard)
-- `test_licensing.py` (HWID derivation, HMAC signature tampering checks)
 - `test_onnx_verifier.py` (Dynamic tensor inspection, L2 norm, Cosine similarity)
 - `test_proposal.py` (Contour + Downsampled NCC, Same-Frame Escalation)
 - `test_runner.py` (Live background runner execution cycle)

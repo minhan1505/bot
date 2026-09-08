@@ -8,7 +8,6 @@ Fully integrates:
   - Global Hotkey Manager (F12) for system-wide emergency stop.
   - Windows System Tray Manager with background status and quick controls.
   - Profile Packaging: ZIP Export and Safe Import.
-  - Licensing & HWID: Commercial authority verification and Machine ID display.
   - Data-Driven Target Calibration: Interactive Empirical Calibration Wizard.
   - Visual Screen ROI Selection: Define region coordinates directly from desktop overlay.
   - Dynamic Workflow Editor: Target selection, action parameters, step reordering.
@@ -37,7 +36,6 @@ from PySide6.QtGui import QIcon, QColor
 from bot.core.models import Profile, Target, RegionModel, Workflow, WorkflowStep, DecisionResult, DecisionClass, CalibrationProfile
 from bot.core.database import Database
 from bot.core.bundle import ProfileBundleManager
-from bot.core.licensing import get_machine_id, verify_license_file, generate_license_data
 from bot.core.hotkey import GlobalHotkeyManager
 from bot.capture.manager import CaptureManager
 from bot.ui.crop_overlay import ScreenCropOverlay
@@ -58,60 +56,6 @@ from bot.telemetry.logger import AsyncTelemetryLogger
 
 MODEL_PATH = os.path.abspath("models/ui_vision_encoder.onnx")
 
-
-class LicenseDialog(QDialog):
-    """Displays Hardware Machine ID and license status."""
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("License & Machine Authorization")
-        self.resize(480, 260)
-        layout = QVBoxLayout(self)
-
-        layout.addWidget(QLabel("Your Unique Machine ID (HWID):"))
-        self.txt_hwid = QLineEdit(get_machine_id())
-        self.txt_hwid.setReadOnly(True)
-        layout.addWidget(self.txt_hwid)
-
-        lic_path = "license.dat"
-        valid, reason, payload = verify_license_file(lic_path, is_dev_mode=False)
-
-        self.lbl_status = QLabel()
-        if valid:
-            self.lbl_status.setText(f"Status: {reason}")
-            self.lbl_status.setStyleSheet("color: #2e7d32; font-weight: bold;")
-        else:
-            self.lbl_status.setText(f"Status: {reason}")
-            self.lbl_status.setStyleSheet("color: #c62828; font-weight: bold;")
-        layout.addWidget(self.lbl_status)
-
-        btn_bar = QHBoxLayout()
-        btn_copy = QPushButton("Copy Machine ID")
-        btn_copy.clicked.connect(self._copy_hwid)
-        btn_bar.addWidget(btn_copy)
-
-        btn_gen_dev = QPushButton("Generate Dev License (30 Days)")
-        btn_gen_dev.clicked.connect(self._generate_dev_license)
-        btn_bar.addWidget(btn_gen_dev)
-
-        btn_close = QPushButton("Close")
-        btn_close.clicked.connect(self.accept)
-        btn_bar.addWidget(btn_close)
-        layout.addLayout(btn_bar)
-
-    def _copy_hwid(self):
-        from PySide6.QtWidgets import QApplication
-        QApplication.clipboard().setText(self.txt_hwid.text())
-        QMessageBox.information(self, "Copied", "Machine ID copied to clipboard.")
-
-    def _generate_dev_license(self):
-        hwid = self.txt_hwid.text()
-        lic_data = generate_license_data(hwid, days_valid=30, tier="COMMERCIAL_PRO")
-        with open("license.dat", "w", encoding="utf-8") as f:
-            f.write(lic_data)
-        QMessageBox.information(self, "License Created", "Development license.dat generated successfully!")
-        valid, reason, _ = verify_license_file("license.dat")
-        self.lbl_status.setText(f"Status: {reason}")
-        self.lbl_status.setStyleSheet("color: #2e7d32; font-weight: bold;")
 
 
 class MainWindow(QMainWindow):
@@ -194,10 +138,6 @@ class MainWindow(QMainWindow):
         self.btn_probe_backend.clicked.connect(self._probe_action_backend)
         top_bar.addWidget(self.btn_probe_backend)
 
-        # License button
-        self.btn_license = QPushButton("License")
-        self.btn_license.clicked.connect(self._open_license_dialog)
-        top_bar.addWidget(self.btn_license)
 
         top_bar.addStretch()
 
@@ -473,9 +413,6 @@ class MainWindow(QMainWindow):
             backend_status=self.action_manager.support_status_message
         )
 
-    def _open_license_dialog(self):
-        dlg = LicenseDialog(self)
-        dlg.exec()
 
     def _export_profile_zip(self):
         if not self.active_profile:
